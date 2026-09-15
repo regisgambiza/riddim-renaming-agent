@@ -95,6 +95,7 @@ class Memory:
             status TEXT NOT NULL DEFAULT 'pending',
             last_decision TEXT,
             confidence TEXT,
+            reason TEXT,
             artist TEXT,
             title TEXT,
             album TEXT,
@@ -133,6 +134,11 @@ class Memory:
         """)
         self.conn.commit()
 
+        columns = [row[1] for row in self.conn.execute("PRAGMA table_info(tracks)")]
+        if "reason" not in columns:
+            self.conn.execute("ALTER TABLE tracks ADD COLUMN reason TEXT")
+            self.conn.commit()
+
     def get_track(self, fingerprint):
         return self.conn.execute(
             "SELECT * FROM tracks WHERE fingerprint=?",
@@ -143,10 +149,10 @@ class Memory:
         self.conn.execute("""
         INSERT INTO tracks (
             fingerprint, path, riddim, year, status,
-            last_decision, confidence, artist, title,
+            last_decision, confidence, reason, artist, title,
             album, original_path, new_path
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(fingerprint) DO UPDATE SET
             path=excluded.path,
             riddim=excluded.riddim,
@@ -154,6 +160,7 @@ class Memory:
             status=excluded.status,
             last_decision=excluded.last_decision,
             confidence=excluded.confidence,
+            reason=excluded.reason,
             artist=excluded.artist,
             title=excluded.title,
             album=excluded.album,
@@ -168,6 +175,7 @@ class Memory:
             data.get("status", "pending"),
             data.get("last_decision"),
             data.get("confidence"),
+            data.get("reason"),
             data.get("artist"),
             data.get("title"),
             data.get("album"),
@@ -243,6 +251,15 @@ class Memory:
         ).fetchone()
 
         return row["value"] if row else None
+
+    def get_unresolved_tracks(self, riddim: str) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM tracks WHERE riddim=? AND status NOT IN "
+            "('completed', 'approved', 'compliant', 'pending_review')",
+            (riddim,)
+        ).fetchall()
+
+        return [dict(r) for r in rows]
 
     def close(self):
         self.conn.close()
@@ -391,11 +408,27 @@ def safe_filename(text: str) -> str:
     return text.strip(" .")
 
 
+def strip_leading_track_number(text: str | None) -> str:
+    value = (text or "").strip()
+
+    while True:
+        match = re.match(r'^(\d{1,2})(?:\s*[.-]\s*|\s+)(.+)$', value)
+        if not match:
+            return value
+        value = match.group(2).strip()
+
+
 def make_filename(track_number, artist, title, extension):
+    if not artist or not title:
+        raise ValueError(
+            f"Artist and title must be non-empty: "
+            f"artist={artist!r}, title={title!r}"
+        )
+
     artist = safe_filename(artist)
     title = safe_filename(title)
 
-    return f"{track_number:02d} - {artist} - {title}{extension}"
+    return f"{artist} - {title}{extension}"
 
 
 # ============================================================
@@ -941,17 +974,15 @@ ABSOLUTE FORMAT RULES:
 - Do not include trailing commas or comments.
 
 JELLYFIN FILENAME STANDARD (MUST follow exactly):
-- Format: NN - Artist - Title.ext  (note the DASH between number and artist)
-- Example: "01 - Capleton - In Her Heart.mp3"
-- Files using dots like "01. Capleton - In Her Heart.mp3" are WRONG and must be cleaned to dashes.
-- If the filename uses a dot separator (e.g. "NN. Artist - Title"), action MUST be CLEAN.
+- Format: Artist - Title.ext
+- Example: "Capleton - In Her Heart.mp3"
+- Any leading track number in the filename is WRONG and must be removed.
+- Examples of WRONG filenames: "01 - Capleton - In Her Heart.mp3", "01. Capleton - In Her Heart.mp3", "02 - 02 Assassin - Still Want More.mp3"
+- If the filename contains a leading track number or duplicated track number, action MUST be CLEAN.
 
 Schema:
 {
     "action": "KEEP|CLEAN|RESEARCH|NEEDS_REVIEW",
-    "artist": "...",
-    "title": "...",
-    "track_number": 1,
     "confidence": "HIGH|MEDIUM|LOW",
     "reason": "..."
 }
@@ -962,8 +993,9 @@ Rules:
 - LOW confidence must not result in an automatic modification.
 - Keep the reason concise but operational.
 - Do NOT include "path" or "filename" in the response object. These fields are for input only. The agent already knows the file paths from its own filesystem scan.
-- If the filename does NOT match "NN - Artist - Title.ext" (dash), action MUST be CLEAN.
-- A CLEAN action means the track needs to be renamed to the Jellyfin dash format and/or have its metadata updated.
+- Do NOT include "artist", "title", or "track_number" in the response object. These fields are derived from filename and metadata by the agent, not the LLM.
+- If the filename does NOT match "Artist - Title.ext", action MUST be CLEAN.
+- A CLEAN action means the track needs to be renamed to the clean artist-title format and its metadata track number preserved/updated.
 """
                 },
                 {
@@ -1067,6 +1099,19 @@ Rules:
             decision["riddim"] = riddim
             decision["year"] = year
 
+            # Defense: if LLM says KEEP but filename doesn't match the
+            # global Jellyfin standard (Artist - Title.ext), force CLEAN.
+            if decision.get("action") == "KEEP":
+                fn = Path(track.get("filename", ""))
+                stem = fn.stem
+                if re.match(r'^\d{1,2}(\s*[-.]\s*|\s+)', stem) or not re.match(r'^.+\s*-\s*.+$', stem):
+                    decision["action"] = "CLEAN"
+                    decision["reason"] = (
+                        f"Filename does not match Jellyfin clean format "
+                        f"Artist - Title: {fn.name}"
+                    )
+                    decision["confidence"] = "HIGH"
+
             if not decision.get("filename"):
                 decision["filename"] = Path(decision.get("path", "")).name
 
@@ -1110,7 +1155,7 @@ IMPORTANT:
 Jellyfin target:
 
 Filename:
-NN - Artist - Song Title.ext
+Artist - Song Title.ext
 
 Metadata:
 Title = Song Title
@@ -1118,7 +1163,7 @@ Artist = Artist
 Album = riddim folder name
 Album Artist = Various Artists
 Year = parent year folder
-Track Number = NN
+Track Number = NN (stored in MP3 metadata only)
 Genre = Dancehall
 
 Confidence policy:
@@ -1161,149 +1206,128 @@ class RiddimAgent:
         riddim: str,
         year: str | None
     ):
+        try:
+            fp = fingerprint(path)
 
-        fp = fingerprint(path)
+            previous = self.memory.get_track(fp)
 
-        previous = self.memory.get_track(fp)
+            if previous:
+                if previous["status"] in {"completed", "approved", "compliant"}:
+                    log(
+                        f"Skipping previously processed track: "
+                        f"{path.name}"
+                    )
+                    return
 
-        if previous:
-            if previous["status"] in {"completed", "approved", "compliant"}:
-                log(
-                    f"Skipping previously processed track: "
-                    f"{path.name}"
+            metadata = read_metadata(path)
+            fn_data = self._parse_filename(path)
+
+            # Enforce Jellyfin dash format: if filename uses dot separator, force CLEAN.
+            if re.match(r'^\d{1,2}\.\s', path.stem):
+                m = re.match(r'^(\d{1,2})\.\s*(.+?)\s*-\s*(.+)$', path.stem)
+                if m:
+                    artist = m.group(2).strip()
+                    title = m.group(3).strip()
+                    track_num = int(m.group(1))
+                    self._used_track_nums.setdefault(riddim, set())
+                    self._used_track_nums[riddim].add(track_num)
+                    if track_num >= self._track_num_counter.get(riddim, 1):
+                        self._track_num_counter[riddim] = track_num + 1
+                    self.tools.pending_proposals.append({
+                        "path": str(path),
+                        "artist": artist,
+                        "title": title,
+                        "track_number": track_num,
+                        "confidence": "HIGH",
+                        "reason": "Filename uses dot format; Jellyfin standard requires dash format.",
+                    })
+                    self.memory.upsert_track({
+                        "fingerprint": fp,
+                        "path": str(path),
+                        "riddim": riddim,
+                        "year": year,
+                        "status": "pending_review",
+                        "last_decision": "CLEAN",
+                        "confidence": "HIGH",
+                        "artist": artist,
+                        "title": title,
+                        "album": riddim,
+                    })
+                    log(
+                        f"Dot-format detected, requiring CLEAN: {path.name}"
+                    )
+                    return
+
+            if re.match(r'^\d{1,2}(\s*[-.]\s*|\s+)', path.stem):
+                ai_log(
+                    f"Fast-path CLEAN for leading-track filename: {path.name}"
                 )
-                return
-
-        metadata = read_metadata(path)
-
-        # Enforce Jellyfin dash format: if filename uses dot separator, force CLEAN.
-        if re.match(r'^\d{1,2}\.\s', path.stem):
-            m = re.match(r'^(\d{1,2})\.\s*(.+?)\s*-\s*(.+)$', path.stem)
-            if m:
-                artist = m.group(2).strip()
-                title = m.group(3).strip()
-                track_num = int(m.group(1))
-                self._used_track_nums.setdefault(riddim, set())
-                self._used_track_nums[riddim].add(track_num)
-                if track_num >= self._track_num_counter.get(riddim, 1):
-                    self._track_num_counter[riddim] = track_num + 1
-                self.tools.pending_proposals.append({
-                    "path": str(path),
-                    "artist": artist,
-                    "title": title,
-                    "track_number": track_num,
+                decision = {
+                    "action": "CLEAN",
                     "confidence": "HIGH",
-                    "reason": "Filename uses dot format; Jellyfin standard requires dash format.",
-                })
+                    "reason": f"Filename contains a leading track number: {path.stem}",
+                }
+                action = "CLEAN"
+            else:
+                context = {
+                    "track_path": str(path),
+                    "filename": path.name,
+                    "riddim": riddim,
+                    "year": year,
+                    "metadata": metadata,
+                    "filename_artist": fn_data["artist"],
+                    "filename_title": fn_data["title"],
+                    "filename_track_number": fn_data["track_number"],
+                    "filename_source": fn_data["source"],
+                }
+
+                messages = [
+                    {
+                        "role": "system",
+                        "content": SYSTEM_PROMPT
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "task": "Analyze this track",
+                                "context": context
+                            },
+                            ensure_ascii=False,
+                            indent=2
+                        )
+                    }
+                ]
+
+                ai_log(
+                    f"Investigating: {path.name}"
+                )
+
+                message = self.llm.chat(messages, tools=None)
+
+                content = message.get("content", "").strip()
+                ai_log(f"Track analysis response: {content[:500]}")
+
+                decision = self._parse_track_response(content)
+
+                action = decision.get("action", "NEEDS_REVIEW")
+
+            if action == "KEEP":
                 self.memory.upsert_track({
                     "fingerprint": fp,
                     "path": str(path),
                     "riddim": riddim,
                     "year": year,
-                    "status": "pending_review",
-                    "last_decision": "CLEAN",
+                    "status": "compliant",
+                    "last_decision": "COMPLIANT",
                     "confidence": "HIGH",
-                    "artist": artist,
-                    "title": title,
+                    "artist": fn_data["artist"] or metadata.get("artist"),
+                    "title": fn_data["title"] or metadata.get("title"),
                     "album": riddim,
                 })
-                log(
-                    f"Dot-format detected, requiring CLEAN: {path.name}"
-                )
                 return
 
-        context = {
-            "track_path": str(path),
-            "filename": path.name,
-            "riddim": riddim,
-            "year": year,
-            "metadata": metadata,
-        }
-
-        messages = [
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "task": "Analyze this track",
-                        "context": context
-                    },
-                    ensure_ascii=False,
-                    indent=2
-                )
-            }
-        ]
-
-        ai_log(
-            f"Investigating: {path.name}"
-        )
-
-        message = self.llm.chat(messages, tools=None)
-
-        content = message.get("content", "").strip()
-        ai_log(f"Track analysis response: {content[:500]}")
-
-        decision = self._parse_track_response(content)
-
-        action = decision.get("action", "NEEDS_REVIEW")
-
-        if action == "KEEP":
-            self.memory.upsert_track({
-                "fingerprint": fp,
-                "path": str(path),
-                "riddim": riddim,
-                "year": year,
-                "status": "compliant",
-                "last_decision": "COMPLIANT",
-                "confidence": "HIGH",
-                "artist": decision.get("artist"),
-                "title": decision.get("title"),
-                "album": riddim,
-            })
-            return
-
-        if action == "NEEDS_REVIEW":
-            self.memory.upsert_track({
-                "fingerprint": fp,
-                "path": str(path),
-                "riddim": riddim,
-                "year": year,
-                "status": "needs_review",
-                "last_decision": "NEEDS_REVIEW",
-                "confidence": "LOW",
-                "reason": decision.get("reason", "Insufficient evidence."),
-            })
-            return
-
-        if action == "CLEAN":
-            artist = decision.get("artist")
-            title = decision.get("title")
-            track_number = decision.get("track_number")
-
-            # Initialize riddim state if needed
-            if riddim not in self._used_track_nums:
-                self._used_track_nums[riddim] = set()
-                self._track_num_counter[riddim] = 1
-
-            # Handle track number: use provided or auto-assign, check for conflicts
-            if track_number:
-                if track_number in self._used_track_nums[riddim]:
-                    # Conflict! Auto-assign next available number
-                    track_number = self._next_track_number(riddim)
-                else:
-                    self._used_track_nums[riddim].add(track_number)
-                    # Update counter if this number is >= current counter
-                    if track_number >= self._track_num_counter[riddim]:
-                        self._track_num_counter[riddim] = track_number + 1
-            else:
-                # No track number provided - auto-assign
-                track_number = self._next_track_number(riddim)
-
-            if not artist or not title:
+            if action == "NEEDS_REVIEW":
                 self.memory.upsert_track({
                     "fingerprint": fp,
                     "path": str(path),
@@ -1312,30 +1336,119 @@ class RiddimAgent:
                     "status": "needs_review",
                     "last_decision": "NEEDS_REVIEW",
                     "confidence": "LOW",
-                    "reason": "Clean decision missing required fields.",
+                    "reason": decision.get("reason", "Insufficient evidence."),
                 })
                 return
 
-            self.tools.pending_proposals.append({
-                "path": str(path),
-                "artist": artist,
-                "title": title,
-                "track_number": int(track_number),
-                "confidence": decision.get("confidence", "HIGH"),
-                "reason": decision.get("reason", "Track needs cleaning."),
-            })
-            return
+            if action == "CLEAN":
+                # Ground truth: prefer embedded metadata over filename-derived values,
+                # because many files in this collection have the correct metadata even
+                # when the filename is wrong.
+                metadata_artist = strip_leading_track_number(metadata.get("artist"))
+                metadata_title = (metadata.get("title") or "").strip()
 
-        self.memory.upsert_track({
-            "fingerprint": fp,
-            "path": str(path),
-            "riddim": riddim,
-            "year": year,
-            "status": "needs_review",
-            "last_decision": "UNKNOWN_ACTION",
-            "confidence": "LOW",
-            "reason": f"Unknown action: {action}",
-        })
+                artist = metadata_artist or (fn_data["artist"] or "").strip()
+                title = metadata_title or (fn_data["title"] or "").strip()
+
+                metadata_tracknumber = metadata.get("tracknumber")
+                if isinstance(metadata_tracknumber, list):
+                    metadata_tracknumber = metadata_tracknumber[0] if metadata_tracknumber else None
+
+                try:
+                    if metadata_tracknumber is not None:
+                        metadata_tracknumber = int(str(metadata_tracknumber).split("/")[0].strip())
+                except Exception:
+                    metadata_tracknumber = None
+
+                # Prefer the parsed filename track number if present, otherwise fall back
+                # to embedded metadata track number, and finally assign the next available.
+                if fn_data["track_number"] is not None:
+                    track_number = fn_data["track_number"]
+                elif metadata_tracknumber is not None:
+                    track_number = metadata_tracknumber
+                else:
+                    track_number = self._next_track_number(riddim)
+
+                # Initialize riddim state if needed
+                if riddim not in self._used_track_nums:
+                    self._used_track_nums[riddim] = set()
+                    self._track_num_counter[riddim] = 1
+
+                # Handle track number: use provided or auto-assign, check for conflicts
+                if track_number:
+                    if track_number in self._used_track_nums[riddim]:
+                        track_number = self._next_track_number(riddim)
+                    else:
+                        self._used_track_nums[riddim].add(track_number)
+                        if track_number >= self._track_num_counter[riddim]:
+                            self._track_num_counter[riddim] = track_number + 1
+                else:
+                    track_number = self._next_track_number(riddim)
+
+                # Verify we have required data before proceeding
+                if not artist or not title:
+                    self.memory.upsert_track({
+                        "fingerprint": fp,
+                        "path": str(path),
+                        "riddim": riddim,
+                        "year": year,
+                        "status": "needs_review",
+                        "last_decision": "NEEDS_REVIEW",
+                        "confidence": "LOW",
+                        "reason": "Cannot determine artist/title from filename or metadata",
+                    })
+                    return
+
+                self.tools.pending_proposals.append({
+                    "path": str(path),
+                    "artist": artist,
+                    "title": title,
+                    "track_number": int(track_number),
+                    "confidence": decision.get("confidence", "HIGH"),
+                    "reason": decision.get("reason", "Track needs cleaning."),
+                })
+                self.memory.upsert_track({
+                    "fingerprint": fp,
+                    "path": str(path),
+                    "riddim": riddim,
+                    "year": year,
+                    "status": "pending_review",
+                    "last_decision": "CLEAN",
+                    "confidence": decision.get("confidence", "HIGH"),
+                    "reason": decision.get("reason", "Track needs cleaning."),
+                    "artist": artist,
+                    "title": title,
+                    "album": riddim,
+                })
+                return
+
+            self.memory.upsert_track({
+                "fingerprint": fp,
+                "path": str(path),
+                "riddim": riddim,
+                "year": year,
+                "status": "needs_review",
+                "last_decision": "UNKNOWN_ACTION",
+                "confidence": "LOW",
+                "reason": f"Unknown action: {action}",
+            })
+
+        except Exception as e:
+            log(f"Error processing {path.name}: {e}")
+            try:
+                fp = locals().get("fp", str(path))
+                self.memory.upsert_track({
+                    "fingerprint": fp,
+                    "path": str(path),
+                    "riddim": riddim,
+                    "year": year,
+                    "status": "error",
+                    "last_decision": "ERROR",
+                    "confidence": "LOW",
+                    "reason": f"Runtime error: {e}",
+                })
+            except Exception:
+                pass
 
     def _parse_track_response(self, content: str) -> dict:
 
@@ -1417,32 +1530,50 @@ class RiddimAgent:
 
         decision: dict = {"action": action}
 
-        artist = extract("artist")
-        if artist:
-            decision["artist"] = artist
-
-        title = extract("title")
-        if title:
-            decision["title"] = title
-
-        track_match = re.search(r'track[_\s]*number[:\s]*(\d+)', content, re.IGNORECASE)
-        if track_match:
-            decision["track_number"] = int(track_match.group(1))
-
-        confidence = extract("confidence")
-        if confidence:
-            decision["confidence"] = confidence.upper()
+        # Only extract action, confidence, and reason from LLM response.
+        # Artist/title/track_number come from filename/metadata ground truth.
+        reason = extract("reason")
+        if reason:
+            decision["reason"] = reason
 
         # Remove any path/filename the LLM might have hallucinated.
         # The agent owns all file paths.
         decision.pop("path", None)
         decision.pop("filename", None)
 
-        reason = extract("reason")
-        if action == "KEEP":
-            return decision
-
         return decision
+
+    def _parse_filename(self, path: Path) -> dict:
+        """Extract artist, title, track_number from filename using regex.
+        Returns dict with keys: track_number, artist, title, source.
+        """
+        stem = path.stem
+        
+        # Dash format: 06 - Major Damage - Tell Me What you Like
+        m = re.match(r'^(\d{1,2})\s*-\s*(.+?)\s*-\s*(.+)$', stem)
+        if m:
+            return {"track_number": int(m.group(1)), "artist": m.group(2).strip(), 
+                    "title": m.group(3).strip(), "source": "filename_dash"}
+        
+# Dot format: 01. Sizzla - Thanks & Praise
+        m = re.match(r'^(\d{1,2})\.\s*(.+?)\s*-\s*(.+)$', stem)
+        if m:
+            return {"track_number": int(m.group(1)), "artist": m.group(2).strip(), 
+                    "title": m.group(3).strip(), "source": "filename_dot"}
+
+        # Space format: NN Artist - Title (missing dash after track number)
+        m = re.match(r'^(\d{1,2})\s+(.+?)\s*-\s*(.+)$', stem)
+        if m:
+            return {"track_number": int(m.group(1)), "artist": m.group(2).strip(),
+                    "title": m.group(3).strip(), "source": "filename_space"}
+
+        # No number: Brian & Tony Gold - Champion
+        m = re.match(r'^(.+?)\s*-\s*(.+)$', stem)
+        if m:
+            return {"track_number": None, "artist": m.group(1).strip(), 
+                    "title": m.group(2).strip(), "source": "filename_no_num"}
+        
+        return {"track_number": None, "artist": "", "title": "", "source": "none"}
 
     def _next_track_number(self, riddim: str) -> int:
         """Get the next available track number for a riddim."""
@@ -1458,6 +1589,170 @@ class RiddimAgent:
             self._track_num_counter[riddim] += 1
 
         return num
+
+    def _find_pending_proposal(self, path: Path):
+        target = str(path)
+        for proposal in self.tools.pending_proposals:
+            if proposal.get("path") == target:
+                return proposal
+        return None
+
+    def verify_single_track(self, path: Path) -> list[dict]:
+        stem = path.stem
+
+        if re.match(r'^\d{1,2}(\s*[-.]\s*|\s+)', stem):
+            return [{
+                "path": str(path),
+                "filename": path.name,
+                "reason": f"Filename contains a leading track number: {path.stem}"
+            }]
+
+        match = re.match(r'^(.+?)\s*-\s*(.+)$', stem)
+        if not match:
+            return [{
+                "path": str(path),
+                "filename": path.name,
+                "reason": f"Does not match Artist - Title: {path.stem}"
+            }]
+
+        artist = match.group(1).strip()
+        title = match.group(2).strip()
+
+        if not artist or not title:
+            return [{
+                "path": str(path),
+                "filename": path.name,
+                "reason": f"Malformed filename structure: {path.stem}"
+            }]
+
+        return []
+
+    def _apply_single_proposal(self, proposal: dict):
+        path = Path(proposal["path"])
+
+        try:
+            original_metadata = read_metadata(path)
+            new_name = make_filename(
+                proposal["track_number"],
+                proposal["artist"],
+                proposal["title"],
+                path.suffix
+            )
+            new_path = path.parent / new_name
+
+            if new_path == path:
+                failures = verify_single_track(path)
+                if failures:
+                    raise RuntimeError(
+                        f"No-op rename generated for non-compliant filename: {path.name}"
+                    )
+
+            if new_path.exists() and new_path != path:
+                raise FileExistsError(
+                    f"Target already exists: {new_path}"
+                )
+
+            new_metadata = {
+                "title": proposal["title"],
+                "artist": proposal["artist"],
+                "album": path.parent.name,
+                "albumartist": "Various Artists",
+                "date": get_riddim_context(path)["year"],
+                "tracknumber": str(proposal["track_number"]),
+                "genre": "Dancehall",
+            }
+
+            write_metadata(path, new_metadata)
+
+            if new_path != path:
+                path.rename(new_path)
+
+            self.memory.upsert_track({
+                "fingerprint": fingerprint(new_path),
+                "path": str(new_path),
+                "riddim": path.parent.name,
+                "year": new_metadata["date"],
+                "status": "completed",
+                "last_decision": "APPLIED",
+                "confidence": proposal["confidence"],
+                "artist": proposal["artist"],
+                "title": proposal["title"],
+                "album": path.parent.name,
+                "original_path": str(path),
+                "new_path": str(new_path),
+                "reason": proposal.get("reason", "Track cleaned."),
+            })
+
+            log(
+                f"APPLIED: {path.name} -> {new_path.name}",
+                "EXECUTE"
+            )
+            return {"success": [str(new_path)], "failed": [], "errors": []}
+
+        except Exception as exc:
+            error_log(
+                f"Failed to modify {path}: {exc}"
+            )
+            return {"success": [], "failed": [str(path)], "errors": [f"{path.name}: {exc}"]}
+
+    def fix_track_until_verified(self, path: Path, riddim: str, year: str | None):
+        current_path = Path(path)
+
+        for attempt in range(5):
+            failures = self.verify_single_track(current_path)
+            if not failures:
+                ai_log(f"Track already verified: {current_path.name}")
+                return True
+
+            ai_log(
+                f"Fix-Verify-Fix loop for {current_path.name} (attempt {attempt + 1})"
+            )
+
+            self.process_track(
+                path=current_path,
+                riddim=riddim,
+                year=year
+            )
+
+            proposal = self._find_pending_proposal(current_path)
+            if proposal is None:
+                ai_log(
+                    f"No proposal generated for {current_path.name}; leaving track unresolved."
+                )
+                return False
+
+            result = self._apply_single_proposal(proposal)
+            self.tools.pending_proposals = [
+                p for p in self.tools.pending_proposals
+                if p is not proposal
+            ]
+
+            if result["failed"]:
+                self.memory.upsert_track({
+                    "fingerprint": fingerprint(current_path),
+                    "path": str(current_path),
+                    "riddim": riddim,
+                    "year": year,
+                    "status": "needs_review",
+                    "last_decision": "FIX_FAILED",
+                    "confidence": "LOW",
+                    "reason": "; ".join(result["errors"]),
+                })
+                return False
+
+            if result["success"]:
+                current_path = Path(result["success"][0])
+                failures = self.verify_single_track(current_path)
+                if not failures:
+                    ai_log(
+                        f"Track fixed and verified: {current_path.name}"
+                    )
+                    return True
+
+        error_log(
+            f"Track did not become compliant after fix attempts: {current_path.name}"
+        )
+        return False
 
     # --------------------------------------------------------
     # Approval
@@ -1505,7 +1800,7 @@ class RiddimAgent:
         proposals = self.show_proposals()
 
         if not proposals:
-            return
+            return {"success": [], "failed": [], "errors": []}
 
         if not AUTO_APPLY:
             answer = input(
@@ -1514,7 +1809,7 @@ class RiddimAgent:
 
             if answer != "y":
                 log("Changes rejected by user.")
-                return
+                return {"success": [], "failed": [], "errors": ["User rejected"]}
 
         if AUTO_APPLY:
             log("AUTO_APPLY enabled - applying without confirmation")
@@ -1524,6 +1819,10 @@ class RiddimAgent:
         ).hexdigest()[:16]
 
         log(f"Applying batch {batch_id}...")
+
+        success = []
+        failed = []
+        errors = []
 
         for p in proposals:
 
@@ -1596,18 +1895,81 @@ class RiddimAgent:
                     f"APPLIED: {path.name} - {new_path.name}",
                     "EXECUTE"
                 )
+                success.append(str(new_path))
 
             except Exception as exc:
 
                 error_log(
                     f"Failed to modify {path}: {exc}"
                 )
+                failed.append(str(path))
+                errors.append(f"{path.name}: {exc}")
 
         self.tools.pending_proposals.clear()
 
         log(
-            f"Batch {batch_id} finished."
+            f"Batch {batch_id} finished. "
+            f"Success: {len(success)}, Failed: {len(failed)}"
         )
+
+        return {"success": success, "failed": failed, "errors": errors}
+
+    def verify_riddim_folder(self, riddim_folder: Path) -> list[dict]:
+
+        failures = []
+
+        for f in sorted(riddim_folder.glob("*.mp3")):
+            stem = f.stem
+
+            if re.match(r'^\d{1,2}(\s*[-.]\s*|\s+)', stem):
+                failures.append({
+                    "path": str(f),
+                    "filename": f.name,
+                    "reason": f"Filename contains a leading track number: {stem}"
+                })
+                continue
+
+            if not re.match(r'^.+\s*-\s*.+$', stem):
+                failures.append({
+                    "path": str(f),
+                    "filename": f.name,
+                    "reason": f"Does not match Artist - Title: {stem}"
+                })
+
+        return failures
+
+    def reprocess_failed_tracks(
+        self,
+        failures: list[dict],
+        riddim: str,
+        year: str | None
+    ):
+
+        for fail in failures:
+            path = Path(fail["path"])
+            fp = fingerprint(path)
+
+            if path.exists():
+                self.memory.upsert_track({
+                    "fingerprint": fp,
+                    "path": str(path),
+                    "riddim": riddim,
+                    "year": year,
+                    "status": "needs_review",
+                    "last_decision": "REPROCESS",
+                    "confidence": "LOW",
+                    "reason": f"Re-processing after verification failure: {fail['reason']}",
+                })
+
+                log(
+                    f"Re-processing: {path.name} - {fail['reason']}"
+                )
+
+                self.process_track(
+                    path=path,
+                    riddim=riddim,
+                    year=year
+                )
 
 
 # ============================================================
@@ -1681,16 +2043,49 @@ def main():
     log("RIDDIM JELLYFIN AI AGENT")
     log("=" * 50)
 
+    target_riddim = None
+    if len(sys.argv) > 1:
+        target_riddim = Path(sys.argv[1]).resolve()
+        if not target_riddim.exists():
+            raise FileNotFoundError(
+                f"Target folder doesn't exist:\n{target_riddim}"
+            )
+        if not target_riddim.is_dir():
+            raise NotADirectoryError(
+                f"Target path is not a directory:\n{target_riddim}"
+            )
+
     if not ROOT_FOLDER.exists():
         raise FileNotFoundError(
             f"Root folder doesn't exist:\n{ROOT_FOLDER}"
         )
+
+    if target_riddim is not None:
+        log(f"Target override: {target_riddim}")
 
     log(f"Root: {ROOT_FOLDER}")
     log(f"Model: {MODEL_PATH}")
     log(f"Memory: {STATE_DB}")
 
     memory = Memory(STATE_DB)
+
+    if target_riddim is not None:
+        target_name = target_riddim.name
+        target_prefix = str(target_riddim)
+
+        memory.conn.execute(
+            "DELETE FROM operations WHERE original_path LIKE ? OR new_path LIKE ?",
+            (f"{target_prefix}%", f"{target_prefix}%")
+        )
+        memory.conn.execute(
+            "DELETE FROM reviews WHERE path LIKE ?",
+            (f"{target_prefix}%",)
+        )
+        memory.conn.execute(
+            "DELETE FROM tracks WHERE riddim = ? OR path LIKE ? OR new_path LIKE ? OR original_path LIKE ?",
+            (target_name, f"{target_prefix}%", f"{target_prefix}%", f"{target_prefix}%")
+        )
+        memory.conn.commit()
 
     server = LlamaServer()
 
@@ -1721,9 +2116,15 @@ def main():
             memory
         )
 
-        for riddim_folder, year in scan_riddims(
-            ROOT_FOLDER
-        ):
+        if target_riddim is not None:
+            year = None
+            if target_riddim.parent.name.isdigit() and len(target_riddim.parent.name) == 4:
+                year = target_riddim.parent.name
+            target_folders = [(target_riddim, year)]
+        else:
+            target_folders = scan_riddims(ROOT_FOLDER)
+
+        for riddim_folder, year in target_folders:
 
                 log("")
                 log("=" * 70)
@@ -1742,6 +2143,18 @@ def main():
                 log(
                     f"{len(tracks)} tracks found."
                 )
+
+                # Seed track number counter from existing filenames
+                # to avoid collisions with already-processed files
+                for t in tracks:
+                    m = re.match(r'^(\d+)\s*-\s', t["filename"])
+                    if m:
+                        num = int(m.group(1))
+                        existing = agent._track_num_counter.get(
+                            riddim_folder.name, 1
+                        )
+                        if num >= existing:
+                            agent._track_num_counter[riddim_folder.name] = num + 1
 
                 # --------------------------------------------------------
                 # BATCH-LEVEL PLANNING
@@ -1829,19 +2242,78 @@ def main():
                         log(
                             f"Processing already-correct track: {path.name}"
                         )
+                        continue
 
-                    agent.process_track(
+                    agent.fix_track_until_verified(
                         path=path,
                         riddim=riddim_folder.name,
                         year=year
                     )
 
                 # --------------------------------------------------------
-                # HUMAN APPROVAL
+                # FIX-VERIFY-FIX LOOP
+                # Apply, verify, reprocess failures, repeat until clean
                 # --------------------------------------------------------
 
                 if agent.tools.pending_proposals:
-                    agent.apply_proposals()
+                    iteration = 0
+                    while agent.tools.pending_proposals:
+                        iteration += 1
+                        log(
+                            f"Fix-verify iteration {iteration}..."
+                        )
+
+                        result = agent.apply_proposals()
+
+                        # Verify the riddim folder
+                        failures = agent.verify_riddim_folder(
+                            riddim_folder
+                        )
+
+                        if not failures:
+                            log(
+                                f"All tracks verified compliant "
+                                f"after {iteration} iteration(s)."
+                            )
+                            break
+
+                        log(
+                            f"Iteration {iteration}: "
+                            f"{len(failures)} track(s) need fixing."
+                        )
+
+                        agent.reprocess_failed_tracks(
+                            failures,
+                            riddim_folder.name,
+                            year
+                        )
+
+                        if iteration >= 100:
+                            error_log(
+                                f"Max iterations reached; "
+                                f"{len(failures)} track(s) still non-compliant."
+                            )
+                            break
+
+                # --------------------------------------------------------
+                # UNRESOLVED TRACKS REPORT
+                # --------------------------------------------------------
+
+                unresolved = [
+                    t for t in agent.memory.get_unresolved_tracks(
+                        riddim_folder.name
+                    )
+                ]
+                if unresolved:
+                    log(
+                        f"{len(unresolved)} track(s) remain unresolved "
+                        f"in {riddim_folder.name}:"
+                    )
+                    for t in unresolved:
+                        log(
+                            f"  - {t.get('filename', t.get('path'))}: "
+                            f"{t.get('reason', 'no reason')}"
+                        )
 
         log("")
         log("=" * 70)
