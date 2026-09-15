@@ -101,6 +101,18 @@ class Memory:
             album TEXT,
             original_path TEXT,
             new_path TEXT,
+            artist_conf TEXT,
+            title_conf TEXT,
+            album_conf TEXT,
+            albumartist_conf TEXT,
+            year_conf TEXT,
+            tracknumber_conf TEXT,
+            genre_conf TEXT,
+            compilation_conf TEXT,
+            discnumber_conf TEXT,
+            fields_changed TEXT,
+            fields_skipped TEXT,
+            fields_skipped_reason TEXT,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -135,9 +147,24 @@ class Memory:
         self.conn.commit()
 
         columns = [row[1] for row in self.conn.execute("PRAGMA table_info(tracks)")]
-        if "reason" not in columns:
-            self.conn.execute("ALTER TABLE tracks ADD COLUMN reason TEXT")
-            self.conn.commit()
+        for col in [
+            "reason",
+            "artist_conf",
+            "title_conf",
+            "album_conf",
+            "albumartist_conf",
+            "year_conf",
+            "tracknumber_conf",
+            "genre_conf",
+            "compilation_conf",
+            "discnumber_conf",
+            "fields_changed",
+            "fields_skipped",
+            "fields_skipped_reason",
+        ]:
+            if col not in columns:
+                self.conn.execute(f"ALTER TABLE tracks ADD COLUMN {col} TEXT")
+        self.conn.commit()
 
     def get_track(self, fingerprint):
         return self.conn.execute(
@@ -150,9 +177,13 @@ class Memory:
         INSERT INTO tracks (
             fingerprint, path, riddim, year, status,
             last_decision, confidence, reason, artist, title,
-            album, original_path, new_path
+            album, original_path, new_path,
+            artist_conf, title_conf, album_conf, albumartist_conf,
+            year_conf, tracknumber_conf, genre_conf, compilation_conf,
+            discnumber_conf, fields_changed, fields_skipped,
+            fields_skipped_reason
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(fingerprint) DO UPDATE SET
             path=excluded.path,
             riddim=excluded.riddim,
@@ -166,6 +197,18 @@ class Memory:
             album=excluded.album,
             original_path=excluded.original_path,
             new_path=excluded.new_path,
+            artist_conf=excluded.artist_conf,
+            title_conf=excluded.title_conf,
+            album_conf=excluded.album_conf,
+            albumartist_conf=excluded.albumartist_conf,
+            year_conf=excluded.year_conf,
+            tracknumber_conf=excluded.tracknumber_conf,
+            genre_conf=excluded.genre_conf,
+            compilation_conf=excluded.compilation_conf,
+            discnumber_conf=excluded.discnumber_conf,
+            fields_changed=excluded.fields_changed,
+            fields_skipped=excluded.fields_skipped,
+            fields_skipped_reason=excluded.fields_skipped_reason,
             updated_at=CURRENT_TIMESTAMP
         """, (
             data["fingerprint"],
@@ -181,6 +224,18 @@ class Memory:
             data.get("album"),
             data.get("original_path"),
             data.get("new_path"),
+            data.get("artist_conf"),
+            data.get("title_conf"),
+            data.get("album_conf"),
+            data.get("albumartist_conf"),
+            data.get("year_conf"),
+            data.get("tracknumber_conf"),
+            data.get("genre_conf"),
+            data.get("compilation_conf"),
+            data.get("discnumber_conf"),
+            data.get("fields_changed"),
+            data.get("fields_skipped"),
+            data.get("fields_skipped_reason"),
         ))
         self.conn.commit()
 
@@ -291,7 +346,12 @@ def fingerprint(path: Path) -> str:
 # ============================================================
 
 def read_metadata(path: Path) -> dict:
-    audio = MutagenFile(str(path), easy=True)
+    try:
+        audio = MutagenFile(str(path), easy=True)
+    except Exception as exc:
+        return {
+            "error": f"Unable to read audio metadata: {exc}"
+        }
 
     if audio is None:
         return {
@@ -313,6 +373,7 @@ def read_metadata(path: Path) -> dict:
         "date": first("date"),
         "tracknumber": first("tracknumber"),
         "discnumber": first("discnumber"),
+        "compilation": first("compilation"),
     }
 
 
@@ -331,6 +392,7 @@ def write_metadata(path: Path, metadata: dict):
         "date": metadata.get("date"),
         "tracknumber": metadata.get("tracknumber"),
         "discnumber": metadata.get("discnumber"),
+        "compilation": metadata.get("compilation"),
     }
 
     for key, value in mapping.items():
@@ -338,6 +400,183 @@ def write_metadata(path: Path, metadata: dict):
             audio[key] = [str(value)]
 
     audio.save()
+    return True
+
+
+def evaluate_field_confidence(field_name: str, current_value, proposed_value, evidence: dict | None = None):
+    """Return (confidence, reason) for a single metadata field."""
+    evidence = evidence or {}
+    sources = evidence.get("sources", {}) if isinstance(evidence, dict) else {}
+
+    if proposed_value is None:
+        return ("SKIP", "No reliable value available for this field.")
+
+    if current_value is not None and str(current_value).strip() == str(proposed_value).strip():
+        if sources:
+            return ("HIGH", "Existing value matches the available evidence.")
+        return ("MEDIUM", "Value already matches the best local evidence.")
+
+    if sources:
+        normalized_sources = [str(v).strip() for v in sources.values() if v not in (None, "", [], {})]
+        if any(str(proposed_value).strip() == str(src) for src in normalized_sources):
+            return ("HIGH", f"Value is supported by {len(normalized_sources)} local evidence source(s).")
+
+    if field_name in {"artist", "title", "album", "albumartist", "year", "tracknumber", "discnumber"}:
+        return ("MEDIUM", "Reasonable local evidence for this field, but not fully confirmed.")
+
+    if field_name == "genre":
+        return ("LOW", "Genre cannot be inferred confidently without stronger evidence.")
+
+    return ("LOW", "Insufficient evidence for a reliable metadata change.")
+
+
+def investigate_metadata(path: Path, riddim: str | None = None, year: str | None = None, sibling_tracks: list[dict] | None = None):
+    """Evaluate all important embedded fields for a track without modifying the file."""
+    file_path = Path(path)
+    metadata = read_metadata(file_path)
+    if "error" in metadata:
+        return {
+            "path": str(file_path),
+            "status": "error",
+            "decision": "NEEDS_REVIEW",
+            "field_decisions": {},
+            "reason": metadata.get("error"),
+            "metadata": metadata,
+            "proposed_changes": {},
+        }
+
+    filename_info = RiddimAgent._parse_filename(file_path)
+    context = get_riddim_context(file_path)
+    folder_name = riddim or file_path.parent.name or context.get("riddim")
+    year_value = year or context.get("year")
+
+    artist = strip_leading_track_number(metadata.get("artist")) or filename_info.get("artist") or ""
+    title = (metadata.get("title") or "").strip() or filename_info.get("title") or ""
+    album = (metadata.get("album") or folder_name or "").strip()
+    albumartist = (metadata.get("albumartist") or "Various Artists").strip() or "Various Artists"
+    date_value = metadata.get("date") or year_value
+    tracknumber = metadata.get("tracknumber")
+    try:
+        if isinstance(tracknumber, list):
+            tracknumber = tracknumber[0] if tracknumber else None
+        if tracknumber is not None:
+            tracknumber = int(str(tracknumber).split("/")[0].strip())
+    except Exception:
+        tracknumber = None
+    if tracknumber is None and filename_info.get("track_number") is not None:
+        tracknumber = filename_info.get("track_number")
+    genre = metadata.get("genre")
+    compilation = metadata.get("compilation") or "Yes"
+    discnumber = metadata.get("discnumber") or "1"
+
+    evidence = {
+        "sources": {
+            "filename_artist": filename_info.get("artist"),
+            "metadata_artist": metadata.get("artist"),
+            "filename_title": filename_info.get("title"),
+            "metadata_title": metadata.get("title"),
+            "riddim": folder_name,
+            "year": year_value,
+            "tracknumber": tracknumber,
+            "albumartist": albumartist,
+        }
+    }
+
+    field_decisions = {}
+    for field_name, current_value, proposed_value in [
+        ("artist", metadata.get("artist"), artist or None),
+        ("title", metadata.get("title"), title or None),
+        ("album", metadata.get("album"), album or None),
+        ("albumartist", metadata.get("albumartist"), albumartist or None),
+        ("year", metadata.get("date"), date_value),
+        ("tracknumber", metadata.get("tracknumber"), tracknumber),
+        ("genre", metadata.get("genre"), genre),
+        ("compilation", metadata.get("compilation"), compilation),
+        ("discnumber", metadata.get("discnumber"), discnumber),
+    ]:
+        confidence, reason = evaluate_field_confidence(field_name, current_value, proposed_value, evidence)
+        if proposed_value is None:
+            field_decisions[field_name] = {
+                "current": current_value,
+                "proposed": None,
+                "decision": "SKIP",
+                "confidence": confidence,
+                "reason": reason,
+            }
+        elif current_value is not None and str(current_value).strip() == str(proposed_value).strip():
+            field_decisions[field_name] = {
+                "current": current_value,
+                "proposed": proposed_value,
+                "decision": "KEEP",
+                "confidence": confidence,
+                "reason": reason,
+            }
+        else:
+            field_decisions[field_name] = {
+                "current": current_value,
+                "proposed": proposed_value,
+                "decision": "METADATA_FIX",
+                "confidence": confidence,
+                "reason": reason,
+            }
+
+    proposed_changes = {
+        field: details["proposed"]
+        for field, details in field_decisions.items()
+        if details["proposed"] is not None and details["decision"] != "KEEP"
+    }
+
+    status = "compliant" if all(details["decision"] in {"KEEP", "SKIP"} for details in field_decisions.values()) else "needs_review"
+    if any(details["decision"] == "METADATA_FIX" and details["confidence"] == "LOW" for details in field_decisions.values()):
+        status = "needs_review"
+
+    return {
+        "path": str(file_path),
+        "status": status,
+        "decision": "METADATA_CHECK",
+        "metadata": metadata,
+        "field_decisions": field_decisions,
+        "proposed_changes": proposed_changes,
+        "reason": "Embedded metadata evaluated against local evidence.",
+    }
+
+
+def verify_metadata_after_write(path: Path, expected: dict | None = None):
+    """Re-read the file after a write and verify the metadata fields that matter."""
+    file_path = Path(path)
+    actual = read_metadata(file_path)
+    if "error" in actual:
+        return {
+            "path": str(file_path),
+            "verified": False,
+            "actual": actual,
+            "missing": [],
+            "errors": [actual.get("error")],
+        }
+
+    expected = expected or {}
+    missing = []
+    errors = []
+    verified = True
+
+    for field_name, expected_value in expected.items():
+        actual_value = actual.get(field_name)
+        if actual_value is None and expected_value is not None:
+            missing.append(field_name)
+            verified = False
+            errors.append(f"Missing field after write: {field_name}")
+            continue
+        if expected_value is not None and str(actual_value).strip() != str(expected_value).strip():
+            verified = False
+            errors.append(f"Field mismatch: {field_name}={actual_value!r} != {expected_value!r}")
+
+    return {
+        "path": str(file_path),
+        "verified": verified,
+        "actual": actual,
+        "missing": missing,
+        "errors": errors,
+    }
 
 
 # ============================================================
@@ -567,6 +806,38 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "investigate_metadata",
+            "description": "Evaluate embedded metadata for a track using file, folder, and sibling evidence without changing the file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "riddim": {"type": "string"},
+                    "year": {"type": "string"},
+                    "sibling_tracks": {"type": "array"}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "verify_metadata_after_write",
+            "description": "Re-read a track after writing metadata and verify that the expected tags match the file on disk.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "expected": {"type": "object"}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "plan_riddim_batch",
             "description": (
                 "Create a batch-level cleanup plan for an entire riddim. "
@@ -686,6 +957,24 @@ class ToolExecutor:
                 "status": "proposal_created",
                 "proposal": proposal
             }
+
+        if name == "investigate_metadata":
+            result = investigate_metadata(
+                Path(args["path"]),
+                riddim=args.get("riddim"),
+                year=args.get("year"),
+                sibling_tracks=args.get("sibling_tracks"),
+            )
+            result_log(json.dumps(result, ensure_ascii=False, indent=2)[:2000])
+            return result
+
+        if name == "verify_metadata_after_write":
+            result = verify_metadata_after_write(
+                Path(args["path"]),
+                expected=args.get("expected")
+            )
+            result_log(json.dumps(result, ensure_ascii=False, indent=2)[:2000])
+            return result
 
         raise ValueError(f"Unknown tool: {name}")
 
@@ -1200,6 +1489,80 @@ class RiddimAgent:
         self._track_num_counter = {}      # riddim -> next available number
         self._used_track_nums = {}        # riddim -> set of used numbers
 
+    def _format_summary_value(self, value):
+        if value is None or value == "":
+            return "SKIPPED"
+
+        if isinstance(value, list):
+            value = value[0] if value else None
+
+        text = str(value).strip()
+        if text in {"", "UNKNOWN", "N/A", "NULL", "None"}:
+            return "SKIPPED"
+        return text
+
+    def print_track_summary(self, path: Path, status: str = "UNKNOWN", reason: str | None = None, metadata: dict | None = None):
+        """Print a concise, verified summary of the actual file state after processing."""
+        safe_path = Path(path)
+        actual_metadata = metadata or read_metadata(safe_path)
+
+        if "error" in actual_metadata:
+            title = "SKIPPED"
+            artist = "SKIPPED"
+            album = "SKIPPED"
+            albumartist = "SKIPPED"
+            track = "SKIPPED"
+            year = "SKIPPED"
+            genre = "SKIPPED"
+            compilation = "SKIPPED"
+            disc = "SKIPPED"
+        else:
+            title = self._format_summary_value(actual_metadata.get("title"))
+            artist = self._format_summary_value(actual_metadata.get("artist"))
+            album = self._format_summary_value(actual_metadata.get("album"))
+            albumartist = self._format_summary_value(actual_metadata.get("albumartist"))
+            track = self._format_summary_value(actual_metadata.get("tracknumber"))
+            year = self._format_summary_value(actual_metadata.get("date"))
+            genre = self._format_summary_value(actual_metadata.get("genre"))
+            compilation = self._format_summary_value(actual_metadata.get("compilation"))
+            disc = self._format_summary_value(actual_metadata.get("discnumber"))
+
+        print()
+        print(f"STATUS: {status.upper()}")
+        print("FILE:")
+        print(f"    {safe_path.name}")
+        print("METADATA:")
+        print(f"    Title        = {title}")
+        print(f"    Artist       = {artist}")
+        print(f"    Album        = {album}")
+        print(f"    Album Artist = {albumartist}")
+        print(f"    Track Number = {track}")
+        print(f"    Year         = {year}")
+        print(f"    Genre        = {genre}")
+        print(f"    Compilation  = {compilation}")
+        print(f"    Disc Number  = {disc}")
+        if reason:
+            print("REASON:")
+            print(f"    {reason}")
+        print()
+
+        return {
+            "status": status,
+            "file": safe_path.name,
+            "metadata": {
+                "title": title,
+                "artist": artist,
+                "album": album,
+                "albumartist": albumartist,
+                "tracknumber": track,
+                "year": year,
+                "genre": genre,
+                "compilation": compilation,
+                "discnumber": disc,
+            },
+            "reason": reason,
+        }
+
     def process_track(
         self,
         path: Path,
@@ -1325,6 +1688,13 @@ class RiddimAgent:
                     "title": fn_data["title"] or metadata.get("title"),
                     "album": riddim,
                 })
+                verified = read_metadata(path)
+                self.print_track_summary(
+                    path,
+                    status="ALREADY_CORRECT",
+                    reason=decision.get("reason", "Track already matches the target state."),
+                    metadata=verified,
+                )
                 return
 
             if action == "NEEDS_REVIEW":
@@ -1338,6 +1708,13 @@ class RiddimAgent:
                     "confidence": "LOW",
                     "reason": decision.get("reason", "Insufficient evidence."),
                 })
+                verified = read_metadata(path)
+                self.print_track_summary(
+                    path,
+                    status="NEEDS_REVIEW",
+                    reason=decision.get("reason", "Insufficient evidence."),
+                    metadata=verified,
+                )
                 return
 
             if action == "CLEAN":
@@ -1420,6 +1797,13 @@ class RiddimAgent:
                     "title": title,
                     "album": riddim,
                 })
+                verified = read_metadata(path)
+                self.print_track_summary(
+                    path,
+                    status="PENDING_REVIEW",
+                    reason=decision.get("reason", "Track needs cleaning."),
+                    metadata=verified,
+                )
                 return
 
             self.memory.upsert_track({
@@ -1683,6 +2067,14 @@ class RiddimAgent:
                 "reason": proposal.get("reason", "Track cleaned."),
             })
 
+            final_metadata = read_metadata(new_path)
+            self.print_track_summary(
+                new_path,
+                status="UPDATED",
+                reason=proposal.get("reason", "Track cleaned."),
+                metadata=final_metadata,
+            )
+
             log(
                 f"APPLIED: {path.name} -> {new_path.name}",
                 "EXECUTE"
@@ -1746,6 +2138,13 @@ class RiddimAgent:
                 if not failures:
                     ai_log(
                         f"Track fixed and verified: {current_path.name}"
+                    )
+                    final_metadata = read_metadata(current_path)
+                    self.print_track_summary(
+                        current_path,
+                        status="UPDATED",
+                        reason="Track fixed and verified.",
+                        metadata=final_metadata,
                     )
                     return True
 
@@ -1988,9 +2387,16 @@ def scan_riddims(root: Path):
         ".wav",
     }
 
+    def folder_has_audio(folder: Path) -> bool:
+        for p in folder.iterdir():
+            if p.is_file() and p.suffix.lower() in audio_extensions:
+                return True
+        return False
+
     # Detect structure:
     #   Case A: root/year/riddim/
     #   Case B: root/riddim/  (flat)
+    #   Case C: root/riddim/riddim/  (nested sample-library layout)
 
     first_level = sorted(root.iterdir())
 
@@ -2013,25 +2419,28 @@ def scan_riddims(root: Path):
 
             year = year_folder.name
 
-            for riddim_folder in sorted(
-                year_folder.iterdir()
-            ):
-
+            for riddim_folder in sorted(year_folder.iterdir()):
                 if not riddim_folder.is_dir():
                     continue
-
-                yield riddim_folder, year
+                if folder_has_audio(riddim_folder):
+                    yield riddim_folder, year
+                    continue
+                for nested in sorted(riddim_folder.iterdir()):
+                    if nested.is_dir() and folder_has_audio(nested):
+                        yield nested, year
+                        break
 
     else:
-
-        # Flat structure: root/riddim/
-        # Try to extract year from folder name.
         for riddim_folder in first_level:
-
             if not riddim_folder.is_dir():
                 continue
-
-            yield riddim_folder, None
+            if folder_has_audio(riddim_folder):
+                yield riddim_folder, None
+                continue
+            for nested in sorted(riddim_folder.iterdir()):
+                if nested.is_dir() and folder_has_audio(nested):
+                    yield nested, None
+                    break
 
 
 # ============================================================
@@ -2241,6 +2650,22 @@ def main():
 
                         log(
                             f"Processing already-correct track: {path.name}"
+                        )
+                        agent.process_track(
+                            path=path,
+                            riddim=riddim_folder.name,
+                            year=year
+                        )
+                        continue
+
+                    if decision["action"] == "NEEDS_REVIEW":
+                        log(
+                            f"Processing review-needed track: {path.name}"
+                        )
+                        agent.process_track(
+                            path=path,
+                            riddim=riddim_folder.name,
+                            year=year
                         )
                         continue
 
