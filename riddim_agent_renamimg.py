@@ -9,6 +9,8 @@ import signal
 import subprocess
 from pathlib import Path
 from typing import Any
+from datetime import datetime
+import yaml
 
 import requests
 from mutagen import File as MutagenFile
@@ -47,9 +49,25 @@ CONTEXT_SIZE = 32768
 N_GPU_LAYERS = "auto"
 
 
-# ============================================================
-# CONSOLE LOGGING
-# ============================================================
+def _load_rules():
+    """Load strict rules from YAML config file.
+    Returns a list of rules sorted by priority (highest first).
+    If the config is missing or invalid, returns an empty list.
+    """
+    rules_path = Path(__file__).parent / "config" / "rules.yaml"
+    try:
+        with open(rules_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+        rules = config.get("strict_rules", [])
+        rules.sort(key=lambda r: r.get("priority", 100), reverse=True)
+        return rules
+    except Exception:
+        print(f"[WARNING] Could not load rules from {rules_path}. Using normal AI reasoning.", flush=True)
+        return []
+
+
+RULES = _load_rules()
+
 
 def log(message: str, prefix: str = "AGENT"):
     safe = message.encode("ascii", "replace").decode("ascii")
@@ -71,6 +89,87 @@ def result_log(message: str):
 
 def error_log(message: str):
     log(message, "ERROR")
+
+
+# ============================================================
+# PROCESSING LOG
+# ============================================================
+
+class ProcessingLog:
+    """Handles detailed per-track logging of metadata changes."""
+
+    def __init__(self, log_dir: Path = None):
+        if log_dir is None:
+            log_dir = Path(__file__).parent / "logs"
+        log_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_path = log_dir / f"processing_log_{timestamp}.txt"
+        self._write_header()
+
+    def _write_header(self):
+        """Initialize log file with header."""
+        header = (
+            f"RIDDIM JELLYFIN AI AGENT - PROCESSING LOG\n"
+            f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"Log file: {self.log_path}\n"
+            f"{'='*80}\n\n"
+        )
+        with open(self.log_path, "w", encoding="utf-8") as f:
+            f.write(header)
+
+    def log_track(self, path: Path, before: dict, after: dict, status: str,
+                  reason: str = "", rule_applied: str = "", decision: str = "",
+                  track_number_before: int = None, track_number_after: int = None):
+        """Log a single track's before/after metadata and processing info."""
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            f.write(f"==================================================\n")
+            f.write(f"TRACK: {path.name}\n")
+            f.write(f"STATUS: {status}\n")
+            f.write(f"TIMESTAMP: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"DECISION: {decision}\n")
+            f.write(f"REASON: {reason}\n")
+            f.write(f"RULE APPLIED: {rule_applied}\n")
+            f.write(f"TRACK NUMBER: {track_number_before or 0} -> {track_number_after or 0}\n")
+            f.write(f"--------------------------------------------------\n")
+            f.write(f"BEFORE:                                  AFTER:\n")
+            # Order of fields for display
+            fields = [
+                ("title", "Title"),
+                ("artist", "Artist"),
+                ("album", "Album"),
+                ("albumartist", "Album Artist"),
+                ("tracknumber", "Track Number"),
+                ("date", "Year"),
+                ("genre", "Genre"),
+                ("compilation", "Compilation"),
+                ("discnumber", "Disc Number"),
+            ]
+            for key, label in fields:
+                # Handle missing/empty values
+                before_val = self._format_value(before.get(key))
+                after_val = self._format_value(after.get(key))
+                f.write(f"{label:<20} = {before_val:<25} {label:<20} = {after_val}\n")
+            # Show file rename if changed
+            before_path = before.get("path") or str(path)
+            after_path = after.get("path") or str(path)
+            if before_path != after_path:
+                f.write(f"FILE NAME    = {Path(before_path).name:<25} FILE NAME    = {Path(after_path).name}\n")
+            f.write(f"==================================================\n\n")
+
+    def _format_value(self, val):
+        """Format value for display."""
+        if val is None or val == "":
+            return "None"
+        # If it's a list, take first element
+        if isinstance(val, list):
+            val = val[0] if val else None
+        if val is None:
+            return "None"
+        return str(val).strip()
+
+
+# Global log instance (set in main)
+processing_log = None
 
 
 # ============================================================
@@ -1442,11 +1541,6 @@ IMPORTANT:
   require human approval.
 
 Jellyfin target:
-
-Filename:
-Artist - Song Title.ext
-
-Metadata:
 Title = Song Title
 Artist = Artist
 Album = riddim folder name
@@ -1466,14 +1560,41 @@ MEDIUM:
 LOW:
     Weak, conflicting, or speculative evidence.
 
-LOW confidence must result in NEEDS_REVIEW.
-
 Do not explain private chain-of-thought.
 Instead provide concise operational reasoning:
 - what you observed
 - what evidence you are using
 - why you are calling a tool
 - what decision you reached
+
+### STRICT RULES SECTION
+
+Throughout this task, you will encounter filename patterns that have established conventions. **When a filename matches one of the following patterns, you MUST adhere to the specified rules. These rules are mandatory constraints, not suggestions.**
+
+Rules are loaded from `config/rules.yaml` at startup. Each rule has:
+- A regex pattern to match against the filename
+- Mandatory metadata values that must be set (these override default reasoning)
+- Forbidden metadata values that must NOT be set
+- Reason text to include in your decision
+
+YOU MUST check for rule matches BEFORE making any decision based on evidence. If a filename matches a rule, the mandatory fields are non-negotiable. If it doesn't match any rule, proceed with normal evidence-based reasoning.
+
+CURRENT RULES:
+1. leading_track_number_dash: Matches "NN - Artist - Title" format.
+   - Mandatory: Title=exact filename title, Artist=exact filename artist, Album=riddim folder name, Album Artist="Various Artists", Track Number=extracted from filename, Genre="Dancehall", Year=valid (1950-2030) or auto
+   - Forbidden: Do NOT set Compilation or Disc Number
+   - Reason: "Filename contains a leading track number: {filename}"
+
+2. artist_dash_title_pattern: Matches "Artist - Title" format (no leading track number).
+   - Mandatory: Title=exact filename title, Artist=exact filename artist, Album=riddim folder name, Album Artist="Various Artists", Track Number=1, Genre="Dancehall", Year=valid (1950-2030) or auto
+   - Forbidden: Do NOT set Compilation or Disc Number
+   - Reason: "Filename matches Artist - Title pattern: {filename}"
+
+If you are uncertain whether a rule applies, err on the side of checking. When in doubt, match the pattern case-insensitively.
+
+YOU CAN NOT OVERRIDE MANDATORY FIELDS FROM A MATCHED RULE. Even if your evidence suggests different values, the rule's mandatory values take precedence. You may only add optional metadata not covered by the rule, or choose NEEDS_REVIEW if the rule truly doesn't fit the track.
+
+IMPORTANT: If a rule matches but you need to override a mandatory field, you MUST respond with NEEDS_REVIEW and explain why the rule doesn't apply or cannot be overridden.
 """
 
 
@@ -1563,6 +1684,98 @@ class RiddimAgent:
             "reason": reason,
         }
 
+    def _check_strict_rules(self, path: Path, riddim: str, year: str | None) -> dict | None:
+        """Check if the filename matches any strict rule.
+        Returns a decision dict if a rule matches, or None if no rule applies.
+        """
+        stem = path.stem
+        filename = path.name
+
+        for rule in RULES:
+            pattern = rule.get("match_pattern")
+            if not pattern:
+                continue
+
+            try:
+                match = re.match(pattern, stem)
+            except re.error:
+                continue
+
+            if not match:
+                continue
+
+            # Rule matched - build the mandatory decision
+            groups = match.groupdict()
+
+            # Build metadata from mandatory fields
+            mandatory = rule.get("mandatory_metadata", {})
+            metadata = {}
+
+            for key, value_template in mandatory.items():
+                if isinstance(value_template, str):
+                    # Resolve template variables
+                    if value_template == "{folder_name}":
+                        metadata[key] = riddim
+                    elif value_template == "{artist}":
+                        metadata[key] = groups.get("artist", "").strip()
+                    elif value_template == "{title}":
+                        metadata[key] = groups.get("title", "").strip()
+                    elif value_template == "{track_number}":
+                        try:
+                            metadata[key] = int(groups.get("track_number", "1"))
+                        except (ValueError, TypeError):
+                            metadata[key] = 1
+                    elif value_template == "auto":
+                        metadata[key] = "auto"
+                    else:
+                        # Literal value
+                        metadata[key] = value_template
+                else:
+                    metadata[key] = value_template
+
+            # Apply year validation if year is "auto"
+            if metadata.get("year") == "auto":
+                year_validation = rule.get("year_validation", {})
+                min_year = year_validation.get("min", 1950)
+                max_year = year_validation.get("max", 2030)
+                on_invalid = year_validation.get("on_invalid", "auto")
+
+                if year is not None:
+                    try:
+                        year_int = int(year)
+                        if min_year <= year_int <= max_year:
+                            metadata["year"] = year
+                        else:
+                            # Year out of range
+                            if on_invalid == "needs_review":
+                                return None  # fall through to normal reasoning
+                            else:
+                                metadata["year"] = "auto"
+                    except (ValueError, TypeError):
+                        metadata["year"] = "auto"
+                else:
+                    metadata["year"] = "auto"
+
+            # Build reason
+            reason_template = rule.get("reason_template", "Filename matched rule: {rule_name}")
+            reason = reason_template.format(
+                filename=filename,
+                rule_name=rule.get("name", "unknown")
+            )
+
+            decision = {
+                "action": "CLEAN",
+                "metadata": metadata,
+                "reason": reason,
+                "confidence": rule.get("confidence", "HIGH"),
+                "rule_applied": rule.get("name", "unknown"),
+                "forbidden": rule.get("forbidden_metadata", []),
+            }
+
+            return decision
+
+        return None
+
     def process_track(
         self,
         path: Path,
@@ -1580,69 +1793,90 @@ class RiddimAgent:
                         f"Skipping previously processed track: "
                         f"{path.name}"
                     )
+                    # Log skipped track
+                    if processing_log is not None:
+                        meta = read_metadata(path)
+                        processing_log.log_track(
+                            path=path,
+                            before=meta,
+                            after=meta,
+                            status="SKIPPED",
+                            reason="Previously processed (completed/approved/compliant)",
+                            rule_applied="",
+                            decision="SKIP",
+                            track_number_before=meta.get("tracknumber"),
+                            track_number_after=meta.get("tracknumber"),
+                        )
                     return
 
             metadata = read_metadata(path)
             fn_data = self._parse_filename(path)
 
-            # Enforce Jellyfin dash format: if filename uses dot separator, force CLEAN.
-            if re.match(r'^\d{1,2}\.\s', path.stem):
-                m = re.match(r'^(\d{1,2})\.\s*(.+?)\s*-\s*(.+)$', path.stem)
-                if m:
-                    artist = m.group(2).strip()
-                    title = m.group(3).strip()
-                    track_num = int(m.group(1))
-                    self._used_track_nums.setdefault(riddim, set())
-                    self._used_track_nums[riddim].add(track_num)
-                    if track_num >= self._track_num_counter.get(riddim, 1):
-                        self._track_num_counter[riddim] = track_num + 1
-                    self.tools.pending_proposals.append({
-                        "path": str(path),
-                        "artist": artist,
-                        "title": title,
-                        "track_number": track_num,
-                        "confidence": "HIGH",
-                        "reason": "Filename uses dot format; Jellyfin standard requires dash format.",
-                    })
-                    self.memory.upsert_track({
-                        "fingerprint": fp,
-                        "path": str(path),
-                        "riddim": riddim,
-                        "year": year,
-                        "status": "pending_review",
-                        "last_decision": "CLEAN",
-                        "confidence": "HIGH",
-                        "artist": artist,
-                        "title": title,
-                        "album": riddim,
-                    })
-                    log(
-                        f"Dot-format detected, requiring CLEAN: {path.name}"
-                    )
-                    return
-
-            if re.match(r'^\d{1,2}(\s*[-.]\s*|\s+)', path.stem):
-                ai_log(
-                    f"Fast-path CLEAN for leading-track filename: {path.name}"
-                )
-                decision = {
-                    "action": "CLEAN",
-                    "confidence": "HIGH",
-                    "reason": f"Filename contains a leading track number: {path.stem}",
-                }
+            # Check strict rules before fast paths or AI reasoning
+            rule_decision = self._check_strict_rules(path, riddim, year)
+            if rule_decision:
+                # Merge rule metadata into decision
+                decision = rule_decision
                 action = "CLEAN"
             else:
-                context = {
-                    "track_path": str(path),
-                    "filename": path.name,
-                    "riddim": riddim,
-                    "year": year,
-                    "metadata": metadata,
-                    "filename_artist": fn_data["artist"],
-                    "filename_title": fn_data["title"],
-                    "filename_track_number": fn_data["track_number"],
-                    "filename_source": fn_data["source"],
-                }
+                # Enforce Jellyfin dash format: if filename uses dot separator, force CLEAN.
+                if re.match(r'^\d{1,2}\.\s', path.stem):
+                    m = re.match(r'^(\d{1,2})\.\s*(.+?)\s*-\s*(.+)$', path.stem)
+                    if m:
+                        artist = m.group(2).strip()
+                        title = m.group(3).strip()
+                        track_num = int(m.group(1))
+                        self._used_track_nums.setdefault(riddim, set())
+                        self._used_track_nums[riddim].add(track_num)
+                        if track_num >= self._track_num_counter.get(riddim, 1):
+                            self._track_num_counter[riddim] = track_num + 1
+                        self.tools.pending_proposals.append({
+                            "path": str(path),
+                            "artist": artist,
+                            "title": title,
+                            "track_number": track_num,
+                            "confidence": "HIGH",
+                            "reason": "Filename uses dot format; Jellyfin standard requires dash format.",
+                        })
+                        self.memory.upsert_track({
+                            "fingerprint": fp,
+                            "path": str(path),
+                            "riddim": riddim,
+                            "year": year,
+                            "status": "pending_review",
+                            "last_decision": "CLEAN",
+                            "confidence": "HIGH",
+                            "artist": artist,
+                            "title": title,
+                            "album": riddim,
+                        })
+                        log(
+                            f"Dot-format detected, requiring CLEAN: {path.name}"
+                        )
+                        return
+
+                if re.match(r'^\d{1,2}(\s*[-.]\s*|\s+)', path.stem):
+                    ai_log(
+                        f"Fast-path CLEAN for leading-track filename: {path.name}"
+                    )
+                    decision = {
+                        "action": "CLEAN",
+                        "confidence": "HIGH",
+                        "reason": f"Filename contains a leading track number: {path.stem}",
+                    }
+                    action = "CLEAN"
+                else:
+                    context = {
+                        "track_path": str(path),
+                        "filename": path.name,
+                        "riddim": riddim,
+                        "year": year,
+                        "metadata": metadata,
+                        "filename_artist": fn_data["artist"],
+                        "filename_title": fn_data["title"],
+                        "filename_track_number": fn_data["track_number"],
+                        "filename_source": fn_data["source"],
+                    }
 
                 messages = [
                     {
@@ -1695,6 +1929,19 @@ class RiddimAgent:
                     reason=decision.get("reason", "Track already matches the target state."),
                     metadata=verified,
                 )
+                # Log unchanged track
+                if processing_log is not None:
+                    processing_log.log_track(
+                        path=path,
+                        before=metadata,
+                        after=verified,
+                        status="ALREADY_CORRECT",
+                        reason=decision.get("reason", "Track already matches the target state."),
+                        rule_applied="",
+                        decision="KEEP",
+                        track_number_before=metadata.get("tracknumber"),
+                        track_number_after=verified.get("tracknumber"),
+                    )
                 return
 
             if action == "NEEDS_REVIEW":
@@ -1715,36 +1962,61 @@ class RiddimAgent:
                     reason=decision.get("reason", "Insufficient evidence."),
                     metadata=verified,
                 )
+                # Log unchanged track needing review
+                if processing_log is not None:
+                    processing_log.log_track(
+                        path=path,
+                        before=metadata,
+                        after=verified,
+                        status="NEEDS_REVIEW",
+                        reason=decision.get("reason", "Insufficient evidence."),
+                        rule_applied="",
+                        decision="NEEDS_REVIEW",
+                        track_number_before=metadata.get("tracknumber"),
+                        track_number_after=verified.get("tracknumber"),
+                    )
                 return
 
             if action == "CLEAN":
                 # Ground truth: prefer embedded metadata over filename-derived values,
                 # because many files in this collection have the correct metadata even
                 # when the filename is wrong.
-                metadata_artist = strip_leading_track_number(metadata.get("artist"))
-                metadata_title = (metadata.get("title") or "").strip()
+                #
+                # However, if a strict rule was applied, use its mandatory metadata
+                # (these are non-negotiable).
+                if decision.get("metadata"):
+                    metadata_artist = decision["metadata"].get("artist", "")
+                    metadata_title = decision["metadata"].get("title", "")
+                    metadata_tracknumber = decision["metadata"].get("track_number")
+                else:
+                    metadata_artist = strip_leading_track_number(metadata.get("artist"))
+                    metadata_title = (metadata.get("title") or "").strip()
 
                 artist = metadata_artist or (fn_data["artist"] or "").strip()
                 title = metadata_title or (fn_data["title"] or "").strip()
 
-                metadata_tracknumber = metadata.get("tracknumber")
-                if isinstance(metadata_tracknumber, list):
-                    metadata_tracknumber = metadata_tracknumber[0] if metadata_tracknumber else None
-
-                try:
-                    if metadata_tracknumber is not None:
-                        metadata_tracknumber = int(str(metadata_tracknumber).split("/")[0].strip())
-                except Exception:
-                    metadata_tracknumber = None
-
-                # Prefer the parsed filename track number if present, otherwise fall back
-                # to embedded metadata track number, and finally assign the next available.
-                if fn_data["track_number"] is not None:
-                    track_number = fn_data["track_number"]
-                elif metadata_tracknumber is not None:
-                    track_number = metadata_tracknumber
+                # Use rule track number if present, otherwise existing logic
+                if decision.get("metadata") and "track_number" in decision["metadata"]:
+                    track_number = int(decision["metadata"]["track_number"])
                 else:
-                    track_number = self._next_track_number(riddim)
+                    metadata_tracknumber = metadata.get("tracknumber")
+                    if isinstance(metadata_tracknumber, list):
+                        metadata_tracknumber = metadata_tracknumber[0] if metadata_tracknumber else None
+
+                    try:
+                        if metadata_tracknumber is not None:
+                            metadata_tracknumber = int(str(metadata_tracknumber).split("/")[0].strip())
+                    except Exception:
+                        metadata_tracknumber = None
+
+                    # Prefer the parsed filename track number if present, otherwise fall back
+                    # to embedded metadata track number, and finally assign the next available.
+                    if fn_data["track_number"] is not None:
+                        track_number = fn_data["track_number"]
+                    elif metadata_tracknumber is not None:
+                        track_number = metadata_tracknumber
+                    else:
+                        track_number = self._next_track_number(riddim)
 
                 # Initialize riddim state if needed
                 if riddim not in self._used_track_nums:
@@ -1783,6 +2055,8 @@ class RiddimAgent:
                     "track_number": int(track_number),
                     "confidence": decision.get("confidence", "HIGH"),
                     "reason": decision.get("reason", "Track needs cleaning."),
+                    "rule_applied": decision.get("rule_applied"),
+                    "rule_metadata": decision.get("metadata"),
                 })
                 self.memory.upsert_track({
                     "fingerprint": fp,
@@ -1796,6 +2070,7 @@ class RiddimAgent:
                     "artist": artist,
                     "title": title,
                     "album": riddim,
+                    "rule_applied": decision.get("rule_applied"),
                 })
                 verified = read_metadata(path)
                 self.print_track_summary(
@@ -2009,6 +2284,24 @@ class RiddimAgent:
                 "reason": f"Malformed filename structure: {path.stem}"
             }]
 
+        # Check if track_number metadata is present and valid (required by strict rules)
+        # Use the same logic as in investigate_metadata and process_track
+        metadata = read_metadata(path)
+        tracknumber = metadata.get("tracknumber")
+        try:
+            if isinstance(tracknumber, list):
+                tracknumber = tracknumber[0] if tracknumber else None
+            if tracknumber is not None:
+                tracknumber = int(str(tracknumber).split("/")[0].strip())
+        except Exception:
+            tracknumber = None
+        if tracknumber is None or tracknumber == 0:
+            return [{
+                "path": str(path),
+                "filename": path.name,
+                "reason": f"Missing or invalid track number metadata for: {path.stem}"
+            }]
+
         return []
 
     def _apply_single_proposal(self, proposal: dict):
@@ -2036,22 +2329,32 @@ class RiddimAgent:
                     f"Target already exists: {new_path}"
                 )
 
+            rule_metadata = proposal.get("rule_metadata") or {}
+            year_value = rule_metadata.get("year") if rule_metadata.get("year") not in (None, "auto") else get_riddim_context(path)["year"]
             new_metadata = {
                 "title": proposal["title"],
                 "artist": proposal["artist"],
                 "album": path.parent.name,
                 "albumartist": "Various Artists",
-                "date": get_riddim_context(path)["year"],
+                "date": year_value,
                 "tracknumber": str(proposal["track_number"]),
                 "genre": "Dancehall",
             }
+            if proposal.get("rule_applied"):
+                forbidden = {
+                    "compilation",
+                    "discnumber",
+                }
+                for field in forbidden:
+                    new_metadata[field] = None
 
             write_metadata(path, new_metadata)
 
             if new_path != path:
                 path.rename(new_path)
 
-            self.memory.upsert_track({
+            rule_applied = proposal.get("rule_applied")
+            upsert_data = {
                 "fingerprint": fingerprint(new_path),
                 "path": str(new_path),
                 "riddim": path.parent.name,
@@ -2065,7 +2368,10 @@ class RiddimAgent:
                 "original_path": str(path),
                 "new_path": str(new_path),
                 "reason": proposal.get("reason", "Track cleaned."),
-            })
+            }
+            if rule_applied:
+                upsert_data["rule_applied"] = rule_applied
+            self.memory.upsert_track(**upsert_data)
 
             final_metadata = read_metadata(new_path)
             self.print_track_summary(
@@ -2074,6 +2380,37 @@ class RiddimAgent:
                 reason=proposal.get("reason", "Track cleaned."),
                 metadata=final_metadata,
             )
+
+            # Log detailed track processing
+            if processing_log is not None:
+                # Determine track numbers before and after
+                try:
+                    tb = original_metadata.get("tracknumber")
+                    if isinstance(tb, list):
+                        tb = tb[0] if tb else None
+                    if tb is not None:
+                        tb = int(str(tb).split("/")[0].strip())
+                except Exception:
+                    tb = None
+                try:
+                    ta = final_metadata.get("tracknumber")
+                    if isinstance(ta, list):
+                        ta = ta[0] if ta else None
+                    if ta is not None:
+                        ta = int(str(ta).split("/")[0].strip())
+                except Exception:
+                    ta = None
+                processing_log.log_track(
+                    path=new_path,
+                    before=original_metadata,
+                    after=final_metadata,
+                    status="UPDATED",
+                    reason=proposal.get("reason", "Track cleaned."),
+                    rule_applied=proposal.get("rule_applied", ""),
+                    decision="CLEAN",
+                    track_number_before=tb,
+                    track_number_after=ta,
+                )
 
             log(
                 f"APPLIED: {path.name} -> {new_path.name}",
@@ -2085,6 +2422,28 @@ class RiddimAgent:
             error_log(
                 f"Failed to modify {path}: {exc}"
             )
+            # Log failure
+            if processing_log is not None:
+                # Determine track numbers before (after is same as before since no change)
+                try:
+                    tb = original_metadata.get("tracknumber")
+                    if isinstance(tb, list):
+                        tb = tb[0] if tb else None
+                    if tb is not None:
+                        tb = int(str(tb).split("/")[0].strip())
+                except Exception:
+                    tb = None
+                processing_log.log_track(
+                    path=path,
+                    before=original_metadata,
+                    after=original_metadata,  # unchanged
+                    status="FAILED",
+                    reason=f"Exception: {exc}",
+                    rule_applied=proposal.get("rule_applied", ""),
+                    decision="CLEAN",
+                    track_number_before=tb,
+                    track_number_after=tb,
+                )
             return {"success": [], "failed": [str(path)], "errors": [f"{path.name}: {exc}"]}
 
     def fix_track_until_verified(self, path: Path, riddim: str, year: str | None):
@@ -2251,10 +2610,20 @@ class RiddimAgent:
                     "artist": p["artist"],
                     "album": path.parent.name,
                     "albumartist": "Various Artists",
-                    "date": get_riddim_context(path)["year"],
+                    "date": (
+                        p.get("rule_metadata", {}).get("year")
+                        if p.get("rule_metadata", {}).get("year") not in (None, "auto")
+                        else get_riddim_context(path)["year"]
+                    ),
                     "tracknumber": str(p["track_number"]),
                     "genre": "Dancehall",
                 }
+
+                # Enforce forbidden fields from strict rules
+                if p.get("rule_applied"):
+                    forbidden = {"compilation", "discnumber"}
+                    for field in forbidden:
+                        new_metadata[field] = None
 
                 self.memory.record_operation(
                     batch_id=batch_id,
@@ -2290,8 +2659,41 @@ class RiddimAgent:
                     "new_path": str(new_path)
                 })
 
+                final_metadata = read_metadata(new_path)
+
+                # Log detailed track processing
+                if processing_log is not None:
+                    # Determine track numbers before and after
+                    try:
+                        tb = original_metadata.get("tracknumber")
+                        if isinstance(tb, list):
+                            tb = tb[0] if tb else None
+                        if tb is not None:
+                            tb = int(str(tb).split("/")[0].strip())
+                    except Exception:
+                        tb = None
+                    try:
+                        ta = final_metadata.get("tracknumber")
+                        if isinstance(ta, list):
+                            ta = ta[0] if ta else None
+                        if ta is not None:
+                            ta = int(str(ta).split("/")[0].strip())
+                    except Exception:
+                        ta = None
+                    processing_log.log_track(
+                        path=new_path,
+                        before=original_metadata,
+                        after=final_metadata,
+                        status="UPDATED",
+                        reason=p.get("reason", "Track cleaned."),
+                        rule_applied=p.get("rule_applied", ""),
+                        decision="CLEAN",
+                        track_number_before=tb,
+                        track_number_after=ta,
+                    )
+
                 log(
-                    f"APPLIED: {path.name} - {new_path.name}",
+                    f"APPLIED: {path.name} -> {new_path.name}",
                     "EXECUTE"
                 )
                 success.append(str(new_path))
@@ -2301,6 +2703,28 @@ class RiddimAgent:
                 error_log(
                     f"Failed to modify {path}: {exc}"
                 )
+                # Log failure
+                if processing_log is not None:
+                    # Determine track numbers before (after same)
+                    try:
+                        tb = original_metadata.get("tracknumber")
+                        if isinstance(tb, list):
+                            tb = tb[0] if tb else None
+                        if tb is not None:
+                            tb = int(str(tb).split("/")[0].strip())
+                    except Exception:
+                        tb = None
+                    processing_log.log_track(
+                        path=path,
+                        before=original_metadata,
+                        after=original_metadata,
+                        status="FAILED",
+                        reason=f"Exception: {exc}",
+                        rule_applied=p.get("rule_applied", ""),
+                        decision="CLEAN",
+                        track_number_before=tb,
+                        track_number_after=tb,
+                    )
                 failed.append(str(path))
                 errors.append(f"{path.name}: {exc}")
 
@@ -2388,59 +2812,35 @@ def scan_riddims(root: Path):
     }
 
     def folder_has_audio(folder: Path) -> bool:
-        for p in folder.iterdir():
-            if p.is_file() and p.suffix.lower() in audio_extensions:
-                return True
+        try:
+            for p in folder.iterdir():
+                if p.is_file() and p.suffix.lower() in audio_extensions:
+                    return True
+        except OSError:
+            return False
         return False
 
-    # Detect structure:
-    #   Case A: root/year/riddim/
-    #   Case B: root/riddim/  (flat)
-    #   Case C: root/riddim/riddim/  (nested sample-library layout)
+    def nearest_year(folder: Path):
+        for parent in [folder, *folder.parents]:
+            if parent.name.isdigit() and len(parent.name) == 4:
+                return parent.name
+        return None
 
-    first_level = sorted(root.iterdir())
+    seen = set()
 
-    has_year_folders = any(
-        p.is_dir()
-        and p.name.isdigit()
-        and len(p.name) == 4
-        for p in first_level
-    )
+    for folder in sorted(root.rglob("*")):
+        if not folder.is_dir():
+            continue
 
-    if has_year_folders:
+        if not folder_has_audio(folder):
+            continue
 
-        for year_folder in first_level:
+        norm = str(folder.resolve())
+        if norm in seen:
+            continue
+        seen.add(norm)
 
-            if not year_folder.is_dir():
-                continue
-
-            if not year_folder.name.isdigit():
-                continue
-
-            year = year_folder.name
-
-            for riddim_folder in sorted(year_folder.iterdir()):
-                if not riddim_folder.is_dir():
-                    continue
-                if folder_has_audio(riddim_folder):
-                    yield riddim_folder, year
-                    continue
-                for nested in sorted(riddim_folder.iterdir()):
-                    if nested.is_dir() and folder_has_audio(nested):
-                        yield nested, year
-                        break
-
-    else:
-        for riddim_folder in first_level:
-            if not riddim_folder.is_dir():
-                continue
-            if folder_has_audio(riddim_folder):
-                yield riddim_folder, None
-                continue
-            for nested in sorted(riddim_folder.iterdir()):
-                if nested.is_dir() and folder_has_audio(nested):
-                    yield nested, None
-                    break
+        yield folder, nearest_year(folder)
 
 
 # ============================================================
@@ -2475,6 +2875,11 @@ def main():
     log(f"Root: {ROOT_FOLDER}")
     log(f"Model: {MODEL_PATH}")
     log(f"Memory: {STATE_DB}")
+
+    # Initialize processing log
+    global processing_log
+    processing_log = ProcessingLog()
+    log(f"Log file: {processing_log.log_path}")
 
     memory = Memory(STATE_DB)
 

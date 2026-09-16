@@ -1,0 +1,79 @@
+# =============================================================
+# Strict Rules Configuration for the Riddim Renaming Agent
+# =============================================================
+# These rules define mandatory metadata constraints that the
+# agent MUST follow when a filename matches the specified
+# pattern.  Rules are checked BEFORE AI reasoning in
+# `RiddimAgent.process_track()`.
+#
+# Pattern variables available in `match_pattern` (named groups):
+#   {artist}  (extracted from regex named group)
+#   {title}   (extracted from regex named group)
+#   {track_number} (extracted from regex named group)
+#
+# Special template variables:
+#   {folder_name}  -> parent folder name (the riddim)
+#   {year}          -> year derived from folder structure (may be None)
+#
+# Order matters: rules are evaluated top-to-bottom. The first
+# matching rule wins. Add more specific rules above generic ones.
+# =============================================================
+
+strict_rules:
+
+  # -----------------------------------------------------------
+  # Rule 1: Leading-track-number dash format  (NN - Artist - Title)
+  # -----------------------------------------------------------
+  # Catches files like "01 - Baby Tash - Nah Bleach.mp3"
+  # The leading track number is stripped from the filename and
+  # metadata fields are populated from the remaining structure.
+  # -----------------------------------------------------------
+  - name: "leading_track_number_dash"
+    description: "NN - Artist - Title format"
+    match_pattern: '^(?P<track_number>\d{1,2})\s*[-.]\s*(?P<artist>.+?)\s*[-.]\s*(?P<title>.+)$'
+    priority: 10
+    mandatory_metadata:
+      title: "{title}"
+      artist: "{artist}"
+      album: "{folder_name}"
+      album_artist: "Various Artists"
+      track_number: "{track_number}"   # extracted from filename
+      genre: "Dancehall"
+      year: "auto"                     # validated; falls back to folder / auto
+    forbidden_metadata:
+      - compilation
+      - disc_number
+    reason_template: "Filename contains a leading track number: {filename}"
+    confidence: "HIGH"
+    year_validation:
+      min: 1950
+      max: 2030
+      on_invalid: "auto"               # options: auto | needs_review
+
+  # -----------------------------------------------------------
+  # Rule 2: Clean Artist - Title  (no leading track number)
+  # -----------------------------------------------------------
+  # Catches files like "Baby Tash - Nah Bleach.mp3"
+  # The track number defaults to 1 (assigned during write).
+  # -----------------------------------------------------------
+  - name: "artist_dash_title_pattern"
+    description: "Artist - Title format (no leading track number)"
+    match_pattern: '^(?!\d{1,2}\s*[-.]\s)(?P<artist>.+?)\s*[-.]\s*(?P<title>.+)$'
+    priority: 100
+    mandatory_metadata:
+      title: "{title}"
+      artist: "{artist}"
+      album: "{folder_name}"
+      album_artist: "Various Artists"
+      track_number: 1
+      genre: "Dancehall"
+      year: "auto"                     # validated; falls back to folder year / auto
+    forbidden_metadata:
+      - compilation
+      - disc_number
+    reason_template: "Filename matches Artist - Title pattern: {filename}"
+    confidence: "HIGH"
+    year_validation:
+      min: 1950
+      max: 2030
+      on_invalid: "auto"               # options: auto | needs_review
