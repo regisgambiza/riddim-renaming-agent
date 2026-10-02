@@ -7,6 +7,7 @@ import sqlite3
 import hashlib
 import signal
 import subprocess
+import traceback
 from pathlib import Path
 from typing import Any
 from datetime import datetime
@@ -29,7 +30,7 @@ SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 8099
 
 # Your riddim collection
-ROOT_FOLDER = Path(r"E:\Sample_Riddim_Collection")
+ROOT_FOLDER = Path(r"D:\Riddim_Juggling")
 
 # Persistent agent memory
 STATE_DB = Path("riddim_agent_memory.db")
@@ -91,6 +92,22 @@ def error_log(message: str):
     log(message, "ERROR")
 
 
+def error_log_detailed(message: str, exc_info=None):
+    """Log error with full traceback and context."""
+    lines = [
+        f"ERROR: {message}",
+        f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+    ]
+    if exc_info:
+        lines.append("Traceback:")
+        lines.extend(traceback.format_tb(exc_info[2]))
+    else:
+        lines.append("Traceback: (no exception info captured)")
+    lines.append("=" * 80)
+    for line in lines:
+        log(line, "DETAILED_ERROR")
+
+
 # ============================================================
 # PROCESSING LOG
 # ============================================================
@@ -124,6 +141,7 @@ class ProcessingLog:
         with open(self.log_path, "a", encoding="utf-8") as f:
             f.write(f"==================================================\n")
             f.write(f"TRACK: {path.name}\n")
+            f.write(f"PATH: {path}\n")
             f.write(f"STATUS: {status}\n")
             f.write(f"TIMESTAMP: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"DECISION: {decision}\n")
@@ -155,6 +173,19 @@ class ProcessingLog:
             if before_path != after_path:
                 f.write(f"FILE NAME    = {Path(before_path).name:<25} FILE NAME    = {Path(after_path).name}\n")
             f.write(f"==================================================\n\n")
+
+    def log_error(self, message: str, exc_info=None):
+        """Log detailed error with traceback to the processing log."""
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*80}\n")
+            f.write(f"ERROR: {message}\n")
+            f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            if exc_info:
+                f.write(f"Traceback:\n")
+                f.write("".join(traceback.format_tb(exc_info[2])))
+            else:
+                f.write(f"Traceback: (no exception info captured)\n")
+            f.write(f"{'='*80}\n\n")
 
     def _format_value(self, val):
         """Format value for display."""
@@ -243,20 +274,32 @@ class Memory:
             resolved INTEGER DEFAULT 0
         );
 
-        CREATE TABLE IF NOT EXISTS folder_status (
-            folder_path TEXT PRIMARY KEY,
-            riddim TEXT NOT NULL,
-            year TEXT,
-            total_tracks INTEGER DEFAULT 0,
-            completed_tracks INTEGER DEFAULT 0,
-            failed_tracks INTEGER DEFAULT 0,
-            needs_review_tracks INTEGER DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'pending',
-            last_scan TIMESTAMP,
-            last_processed TIMESTAMP,
-            error_count INTEGER DEFAULT 0
-        );
-        """)
+         CREATE TABLE IF NOT EXISTS folder_status (
+             folder_path TEXT PRIMARY KEY,
+             riddim TEXT NOT NULL,
+             year TEXT,
+             total_tracks INTEGER DEFAULT 0,
+             completed_tracks INTEGER DEFAULT 0,
+             failed_tracks INTEGER DEFAULT 0,
+             needs_review_tracks INTEGER DEFAULT 0,
+             status TEXT NOT NULL DEFAULT 'pending',
+             last_scan TIMESTAMP,
+             last_processed TIMESTAMP,
+             error_count INTEGER DEFAULT 0
+         );
+
+         CREATE TABLE IF NOT EXISTS artist_cache (
+             artist_name TEXT PRIMARY KEY,
+             verified INTEGER NOT NULL DEFAULT 0,  -- 0 = unknown, 1 = verified real, 2 = verified fake
+             spotify_id TEXT,
+             youtube_channel_id TEXT,
+             popularity INTEGER,
+             followers INTEGER,
+             genres TEXT,  -- JSON array
+             last_verified TIMESTAMP,
+             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+         );
+         """)
         self.conn.commit()
 
         columns = [row[1] for row in self.conn.execute("PRAGMA table_info(tracks)")]
@@ -504,6 +547,64 @@ class Memory:
         ).fetchall()
 
         return [dict(r) for r in rows]
+
+    # --- Artist Cache Methods ---
+    def get_artist_cache(self, artist_name: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM artist_cache WHERE artist_name=?",
+            (artist_name,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_artist_cache(self, artist_name: str, verified: int = 0,
+                             spotify_id: str = None, youtube_channel_id: str = None,
+                             popularity: int = None, followers: int = None,
+                             genres: list = None):
+        import json
+        genres_json = json.dumps(genres) if genres else None
+        
+        # Build dynamic UPDATE clause to only update provided fields
+        updates = ["verified=excluded.verified"]
+        params = [artist_name, verified, spotify_id, youtube_channel_id, 
+                  popularity, followers, genres_json]
+        
+        if spotify_id is not None:
+            updates.append("spotify_id=excluded.spotify_id")
+        if youtube_channel_id is not None:
+            updates.append("youtube_channel_id=excluded.youtube_channel_id")
+        if popularity is not None:
+            updates.append("popularity=excluded.popularity")
+        if followers is not None:
+            updates.append("followers=excluded.followers")
+        if genres_json is not None:
+            updates.append("genres=excluded.genres")
+            
+        update_clause = ", ".join(updates)
+        
+        self.conn.execute(f"""
+        INSERT INTO artist_cache (artist_name, verified, spotify_id, youtube_channel_id,
+                                  popularity, followers, genres, last_verified)
+        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(artist_name) DO UPDATE SET
+            {update_clause},
+            last_verified=CURRENT_TIMESTAMP
+        """, params)
+        self.conn.commit()
+
+    def get_or_create_artist_cache(self, artist_name: str) -> dict:
+        cached = self.get_artist_cache(artist_name)
+        if cached is None:
+            cached = {
+                "artist_name": artist_name,
+                "verified": 0,
+                "spotify_id": None,
+                "youtube_channel_id": None,
+                "popularity": None,
+                "followers": None,
+                "genres": None,
+                "last_verified": None
+            }
+        return cached
 
     def close(self):
         self.conn.close()
@@ -1072,6 +1173,23 @@ TOOLS = [
                 ]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_artist_online",
+            "description": "Search for an artist on Spotify and YouTube to verify if they are real. Uses cached results when available.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "artist_name": {
+                        "type": "string",
+                        "description": "The name of the artist to verify"
+                    }
+                },
+                "required": ["artist_name"]
+            }
+        }
     }
 ]
 
@@ -1165,7 +1283,148 @@ class ToolExecutor:
             result_log(json.dumps(result, ensure_ascii=False, indent=2)[:2000])
             return result
 
+        if name == "search_artist_online":
+            return self._search_artist_online(args)
+
         raise ValueError(f"Unknown tool: {name}")
+
+    def _search_artist_online(self, args: dict) -> dict:
+        """Search Spotify and YouTube for artist verification."""
+        artist_name = args.get("artist_name", "").strip()
+        if not artist_name:
+            return {"error": "No artist name provided"}
+
+        # Check cache first - if we have BOTH IDs, return from cache immediately
+        cached = self.memory.get_artist_cache(artist_name)
+        if cached and cached.get("verified") in (1, 2):
+            # If both sources verified, return from cache
+            if cached.get("spotify_id") and cached.get("youtube_channel_id"):
+                return {
+                    "artist_name": artist_name,
+                    "verified": cached["verified"],
+                    "source": "cache",
+                    "spotify_id": cached.get("spotify_id"),
+                    "youtube_channel_id": cached.get("youtube_channel_id"),
+                    "genres": cached.get("genres"),
+                    "popularity": cached.get("popularity"),
+                    "followers": cached.get("followers")
+                }
+
+        # Need to search - start with cached values if any
+        has_spotify = bool(cached.get("spotify_id")) if cached else False
+        has_youtube = bool(cached.get("youtube_channel_id")) if cached else False
+
+        # Fallback if not fully cached
+        if not has_spotify or not has_youtube:
+            if cached:
+                result = {
+                    "artist_name": artist_name,
+                    "verified": cached.get("verified", 0),
+                    "source": "api",
+                    "spotify_id": cached.get("spotify_id"),
+                    "youtube_channel_id": cached.get("youtube_channel_id"),
+                    "genres": cached.get("genres"),
+                    "popularity": cached.get("popularity"),
+                    "followers": cached.get("followers")
+                }
+            else:
+                result = {"artist_name": artist_name, "verified": 0, "source": "api"}
+        else:
+            result = {"artist_name": artist_name, "verified": 0, "source": "api"}
+
+        # Search Spotify if needed
+        if not has_spotify:
+            try:
+                client_id = "072209652b0243f3b6f357577e103adf"
+                client_secret = "2a868134eeab4a9db5a43e4fb3ce610c"
+                import base64
+                auth_str = f"{client_id}:{client_secret}"
+                b64auth = base64.b64encode(auth_str.encode()).decode()
+                headers = {"Authorization": f"Basic {b64auth}"}
+                token_resp = requests.post(
+                    "https://accounts.spotify.com/api/token",
+                    headers=headers,
+                    data={"grant_type": "client_credentials"},
+                    timeout=10
+                )
+                if token_resp.status_code == 200:
+                    access_token = token_resp.json().get("access_token")
+                    if access_token:
+                        search_headers = {"Authorization": f"Bearer {access_token}"}
+                        search_resp = requests.get(
+                            "https://api.spotify.com/v1/search",
+                            headers=search_headers,
+                            params={"q": artist_name, "type": "artist", "limit": 1},
+                            timeout=10
+                        )
+                        if search_resp.status_code == 200:
+                            artists = search_resp.json().get("artists", {}).get("items", [])
+                            if artists:
+                                artist_data = artists[0]
+                                spotify_id = artist_data.get("id")
+                                name = artist_data.get("name")
+                                popularity = artist_data.get("popularity", 0)
+                                genres = artist_data.get("genres", [])
+                                if result.get("verified") == 0:
+                                    result["verified"] = 1
+                                result["spotify_id"] = spotify_id
+                                result["name"] = name
+                                result["popularity"] = popularity
+                                result["genres"] = genres
+                                self.memory.upsert_artist_cache(
+                                    artist_name,
+                                    verified=result["verified"],
+                                    spotify_id=spotify_id,
+                                    popularity=popularity,
+                                    genres=genres
+                                )
+            except Exception as e:
+                result["spotify_error"] = str(e)
+
+        # Search YouTube if needed
+        if not has_youtube:
+            youtube_key = os.environ.get("YOUTUBE_API_KEY")
+            if youtube_key:
+                try:
+                    yt_resp = requests.get(
+                        "https://www.googleapis.com/youtube/v3/search",
+                        params={
+                            "part": "snippet",
+                            "q": artist_name,
+                            "type": "channel",
+                            "maxResults": 1,
+                            "key": youtube_key
+                        },
+                        timeout=10
+                    )
+                    if yt_resp.status_code == 200:
+                        items = yt_resp.json().get("items", [])
+                        if items:
+                            channel = items[0]
+                            youtube_id = channel.get("id", {}).get("channelId")
+                            if result.get("verified") == 0:
+                                result["verified"] = 1
+                            result["youtube_channel_id"] = youtube_id
+                            result["youtube_title"] = channel.get("snippet", {}).get("title")
+                            result["youtube_description"] = channel.get("snippet", {}).get("description")
+                            self.memory.upsert_artist_cache(
+                                artist_name,
+                                verified=2 if result["verified"] > 1 else 1,
+                                youtube_channel_id=youtube_id,
+                                genres=result.get("genres")
+                            )
+                except Exception as e:
+                    result["youtube_error"] = str(e)
+            else:
+                result["youtube_note"] = "Set YOUTUBE_API_KEY env var for YouTube search"
+        else:
+            result["verified"] = 2
+
+        # If nothing verified from API, mark as 0 (unknown/fake)
+        if result.get("verified") == 0:
+            self.memory.upsert_artist_cache(artist_name, verified=0)
+
+        return result
 
 
 # ============================================================
@@ -1955,7 +2214,14 @@ class RiddimAgent:
                         "reason": f"Filename contains a leading track number: {path.stem}",
                     }
                     action = "CLEAN"
+                    skip_llm = True
                 else:
+                    ai_log(
+                        f"Investigating: {path.name}"
+                    )
+                    skip_llm = False
+
+                if not skip_llm:
                     context = {
                         "track_path": str(path),
                         "filename": path.name,
@@ -1968,50 +2234,90 @@ class RiddimAgent:
                         "filename_source": fn_data["source"],
                     }
 
-                messages = [
-                    {
-                        "role": "system",
-                        "content": SYSTEM_PROMPT
-                    },
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            {
-                                "task": "Analyze this track",
-                                "context": context
-                            },
-                            ensure_ascii=False,
-                            indent=2
-                        )
-                    }
-                ]
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": SYSTEM_PROMPT
+                        },
+                        {
+                            "role": "user",
+                            "content": json.dumps(
+                                {
+                                    "task": "Analyze this track",
+                                    "context": context
+                                },
+                                ensure_ascii=False,
+                                indent=2
+                            )
+                        }
+                    ]
 
-                ai_log(
-                    f"Investigating: {path.name}"
-                )
+                    ai_log(
+                        f"Investigating: {path.name}"
+                    )
 
-                message = self.llm.chat(messages, tools=None)
+                    message = self.llm.chat(messages, tools=None)
 
-                content = message.get("content", "").strip()
-                ai_log(f"Track analysis response: {content[:500]}")
+                    content = message.get("content", "").strip()
+                    ai_log(f"Track analysis response: {content[:500]}")
 
-                decision = self._parse_track_response(content)
+                    decision = self._parse_track_response(content)
 
-                action = decision.get("action", "NEEDS_REVIEW")
+                    action = decision.get("action", "NEEDS_REVIEW")
 
             if action == "KEEP":
-                self.memory.upsert_track({
-                    "fingerprint": fp,
-                    "path": str(path),
-                    "riddim": riddim,
-                    "year": year,
-                    "status": "compliant",
-                    "last_decision": "COMPLIANT",
-                    "confidence": "HIGH",
-                    "artist": fn_data["artist"] or metadata.get("artist"),
-                    "title": fn_data["title"] or metadata.get("title"),
+                # Build complete Jellyfin metadata using filename ground truth
+                # with strict-rules fallback for required fields.
+                metadata_artist = fn_data["artist"] or metadata.get("artist") or ""
+                metadata_title = fn_data["title"] or metadata.get("title") or ""
+
+                # Ensure artist and title are not empty after stripping
+                if not metadata_artist or not metadata_title:
+                    # Try to salvage from existing metadata if filename parse was empty
+                    metadata_artist = metadata.get("artist") or ""
+                    metadata_title = metadata.get("title") or ""
+
+                # Use the same logic as CLEAN path for track number
+                metadata_tracknumber = metadata.get("tracknumber")
+                try:
+                    if isinstance(metadata_tracknumber, list):
+                        metadata_tracknumber = metadata_tracknumber[0] if metadata_tracknumber else None
+                    if metadata_tracknumber is not None:
+                        metadata_tracknumber = int(str(metadata_tracknumber).split("/")[0].strip())
+                except Exception:
+                    metadata_tracknumber = None
+
+                # Prefer the parsed filename track number if present
+                if fn_data["track_number"] is not None:
+                    track_number = fn_data["track_number"]
+                elif metadata_tracknumber is not None:
+                    track_number = metadata_tracknumber
+                else:
+                    track_number = self._next_track_number(riddim)
+
+                if track_number:
+                    if track_number in self._used_track_nums[riddim]:
+                        track_number = self._next_track_number(riddim)
+                    else:
+                        self._used_track_nums[riddim].add(track_number)
+                        if track_number >= self._track_num_counter.get(riddim, 1):
+                            self._track_num_counter[riddim] = track_number + 1
+
+                # Build new metadata dict matching the strict-rule schema
+                new_metadata = {
+                    "title": metadata_title.strip(),
+                    "artist": metadata_artist.strip(),
                     "album": riddim,
-                })
+                    "albumartist": "Various Artists",
+                    "date": year if year else "",
+                    "tracknumber": str(track_number),
+                    "genre": "Dancehall",
+                }
+
+                # Write the new metadata to the file
+                write_metadata(path, new_metadata)
+
+                # Read it back to confirm and display
                 verified = read_metadata(path)
                 self.print_track_summary(
                     path,
@@ -2183,7 +2489,15 @@ class RiddimAgent:
             })
 
         except Exception as e:
-            log(f"Error processing {path.name}: {e}")
+            error_log_detailed(
+                f"Error processing {path.name} in {riddim}: {e}",
+                exc_info=sys.exc_info()
+            )
+            if processing_log:
+                processing_log.log_error(
+                    f"Error processing {path.name} in {riddim}: {e}",
+                    exc_info=sys.exc_info()
+                )
             try:
                 fp = locals().get("fp", str(path))
                 self.memory.upsert_track({
@@ -2316,12 +2630,31 @@ class RiddimAgent:
             return {"track_number": int(m.group(1)), "artist": m.group(2).strip(),
                     "title": m.group(3).strip(), "source": "filename_space"}
 
-        # No number: Brian & Tony Gold - Champion
-        m = re.match(r'^(.+?)\s*-\s*(.+)$', stem)
+        # No number: Brian & Tony Gold - Champion OR Artist - Title
+        # Also handle Artist # Title and Artist @ Title formats common in riddim packs
+        m = re.match(r'^(.+?)\s*[-.]\s*(.+)$', stem)
         if m:
-            return {"track_number": None, "artist": m.group(1).strip(), 
-                    "title": m.group(2).strip(), "source": "filename_no_num"}
+            artist = m.group(1).strip()
+            title = m.group(2).strip()
+            if artist and title:
+                return {"track_number": None, "artist": artist, "title": title, "source": "filename_no_num"}
         
+        # Handle Artist # Title pattern
+        m = re.match(r'^(.+?)\s*#\s*(.+)$', stem)
+        if m:
+            artist = m.group(1).strip()
+            title = m.group(2).strip()
+            if artist and title:
+                return {"track_number": None, "artist": artist, "title": title, "source": "filename_hash"}
+
+        # Handle Artist @ Title pattern
+        m = re.match(r'^(.+?)\s*@\s*(.+)$', stem)
+        if m:
+            artist = m.group(1).strip()
+            title = m.group(2).strip()
+            if artist and title:
+                return {"track_number": None, "artist": artist, "title": title, "source": "filename_at"}
+
         return {"track_number": None, "artist": "", "title": "", "source": "none"}
 
     def _next_track_number(self, riddim: str) -> int:
@@ -2356,22 +2689,36 @@ class RiddimAgent:
                 "reason": f"Filename contains a leading track number: {path.stem}"
             }]
 
-        match = re.match(r'^(.+?)\s*-\s*(.+)$', stem)
-        if not match:
+        # Try the same patterns as _parse_filename in order of preference
+        match = None
+        artist = ""
+        title = ""
+
+        # Dash format: Artist - Title (preferred)
+        match = re.match(r'^(.+?)\s*[-.]\s*(.+)$', stem)
+        if match:
+            artist = match.group(1).strip()
+            title = match.group(2).strip()
+        
+        # Hash format: Artist # Title
+        if not (artist and title):
+            match = re.match(r'^(.+?)\s*#\s*(.+)$', stem)
+            if match:
+                artist = match.group(1).strip()
+                title = match.group(2).strip()
+        
+        # At format: Artist @ Title
+        if not (artist and title):
+            match = re.match(r'^(.+?)\s*@\s*(.+)$', stem)
+            if match:
+                artist = match.group(1).strip()
+                title = match.group(2).strip()
+
+        if not match or not artist or not title:
             return [{
                 "path": str(path),
                 "filename": path.name,
-                "reason": f"Does not match Artist - Title: {path.stem}"
-            }]
-
-        artist = match.group(1).strip()
-        title = match.group(2).strip()
-
-        if not artist or not title:
-            return [{
-                "path": str(path),
-                "filename": path.name,
-                "reason": f"Malformed filename structure: {path.stem}"
+                "reason": f"Does not match supported Artist - Title patterns: {path.stem}"
             }]
 
         # Check if track_number metadata is present and valid (required by strict rules)
@@ -2408,7 +2755,7 @@ class RiddimAgent:
             new_path = path.parent / new_name
 
             if new_path == path:
-                failures = verify_single_track(path)
+                failures = self.verify_single_track(path)
                 if failures:
                     raise RuntimeError(
                         f"No-op rename generated for non-compliant filename: {path.name}"
@@ -2461,7 +2808,7 @@ class RiddimAgent:
             }
             if rule_applied:
                 upsert_data["rule_applied"] = rule_applied
-            self.memory.upsert_track(**upsert_data)
+            self.memory.upsert_track(upsert_data)
 
             final_metadata = read_metadata(new_path)
             self.print_track_summary(
@@ -2509,31 +2856,9 @@ class RiddimAgent:
             return {"success": [str(new_path)], "failed": [], "errors": []}
 
         except Exception as exc:
-            error_log(
-                f"Failed to modify {path}: {exc}"
-            )
-            # Log failure
+            error_log_detailed(f"Failed to modify {path}: {exc}", exc_info=sys.exc_info())
             if processing_log is not None:
-                # Determine track numbers before (after is same as before since no change)
-                try:
-                    tb = original_metadata.get("tracknumber")
-                    if isinstance(tb, list):
-                        tb = tb[0] if tb else None
-                    if tb is not None:
-                        tb = int(str(tb).split("/")[0].strip())
-                except Exception:
-                    tb = None
-                processing_log.log_track(
-                    path=path,
-                    before=original_metadata,
-                    after=original_metadata,  # unchanged
-                    status="FAILED",
-                    reason=f"Exception: {exc}",
-                    rule_applied=proposal.get("rule_applied", ""),
-                    decision="CLEAN",
-                    track_number_before=tb,
-                    track_number_after=tb,
-                )
+                processing_log.log_error(f"Failed to modify {path}: {exc}", exc_info=sys.exc_info())
             return {"success": [], "failed": [str(path)], "errors": [f"{path.name}: {exc}"]}
 
     def fix_track_until_verified(self, path: Path, riddim: str, year: str | None):
@@ -2701,8 +3026,8 @@ class RiddimAgent:
                     "album": path.parent.name,
                     "albumartist": "Various Artists",
                     "date": (
-                        p.get("rule_metadata", {}).get("year")
-                        if p.get("rule_metadata", {}).get("year") not in (None, "auto")
+                        (p.get("rule_metadata") or {}).get("year")
+                        if (p.get("rule_metadata") or {}).get("year") not in (None, "auto")
                         else get_riddim_context(path)["year"]
                     ),
                     "tracknumber": str(p["track_number"]),
@@ -2789,32 +3114,9 @@ class RiddimAgent:
                 success.append(str(new_path))
 
             except Exception as exc:
-
-                error_log(
-                    f"Failed to modify {path}: {exc}"
-                )
-                # Log failure
+                error_log_detailed(f"Failed to modify {path}: {exc}", exc_info=sys.exc_info())
                 if processing_log is not None:
-                    # Determine track numbers before (after same)
-                    try:
-                        tb = original_metadata.get("tracknumber")
-                        if isinstance(tb, list):
-                            tb = tb[0] if tb else None
-                        if tb is not None:
-                            tb = int(str(tb).split("/")[0].strip())
-                    except Exception:
-                        tb = None
-                    processing_log.log_track(
-                        path=path,
-                        before=original_metadata,
-                        after=original_metadata,
-                        status="FAILED",
-                        reason=f"Exception: {exc}",
-                        rule_applied=p.get("rule_applied", ""),
-                        decision="CLEAN",
-                        track_number_before=tb,
-                        track_number_after=tb,
-                    )
+                    processing_log.log_error(f"Failed to modify {path}: {exc}", exc_info=sys.exc_info())
                 failed.append(str(path))
                 errors.append(f"{path.name}: {exc}")
 
@@ -3177,12 +3479,28 @@ def main():
                     memory.update_folder_progress(riddim_folder, riddim_folder.name, needs_review=True)
                     continue
 
-                agent.fix_track_until_verified(
-                    path=path,
-                    riddim=riddim_folder.name,
-                    year=year
-                )
-                memory.update_folder_progress(riddim_folder, riddim_folder.name, completed=True)
+                try:
+                    agent.fix_track_until_verified(
+                        path=path,
+                        riddim=riddim_folder.name,
+                        year=year
+                    )
+                    memory.update_folder_progress(riddim_folder, riddim_folder.name, completed=True)
+                except Exception as exc:
+                    error_log_detailed(
+                        f"Track failed to fix: {path} ({riddim_folder.name}): {exc}",
+                        exc_info=sys.exc_info()
+                    )
+                    if processing_log:
+                        processing_log.log_error(
+                            f"Track failed to fix: {path} ({riddim_folder.name}): {exc}",
+                            exc_info=sys.exc_info()
+                        )
+                    memory.update_folder_progress(
+                        riddim_folder,
+                        riddim_folder.name,
+                        needs_review=True
+                    )
 
             # --------------------------------------------------------
             # FIX-VERIFY-FIX LOOP
@@ -3197,7 +3515,19 @@ def main():
                         f"Fix-verify iteration {iteration}..."
                     )
 
-                    result = agent.apply_proposals()
+                    try:
+                        result = agent.apply_proposals()
+                    except Exception as exc:
+                        error_log_detailed(
+                            f"apply_proposals failed for {riddim_folder.name}: {exc}",
+                            exc_info=sys.exc_info()
+                        )
+                        if processing_log:
+                            processing_log.log_error(
+                                f"apply_proposals failed for {riddim_folder.name}: {exc}",
+                                exc_info=sys.exc_info()
+                            )
+                        break
 
                     # Verify the riddim folder
                     failures = agent.verify_riddim_folder(
@@ -3272,8 +3602,7 @@ def main():
         log("Interrupted by user.")
 
     except Exception as exc:
-
-        error_log(str(exc))
+        error_log_detailed(str(exc), exc_info=sys.exc_info())
 
     finally:
 
