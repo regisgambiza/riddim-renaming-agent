@@ -43,7 +43,7 @@ MAX_AGENT_STEPS = 40
 
 # Seconds to pause between scanned folders during initial scan.
 # Increase this to reduce I/O load on a slow/failing HDD.
-SCAN_DELAY_SECONDS = 0.0
+SCAN_DELAY_SECONDS = 1.0
 
 # AI parameters
 TEMPERATURE = 0.1
