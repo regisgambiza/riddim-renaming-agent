@@ -41,6 +41,10 @@ AUTO_APPLY = True
 # Number of agent iterations before forcing a fresh context
 MAX_AGENT_STEPS = 40
 
+# Seconds to pause between scanned folders during initial scan.
+# Increase this to reduce I/O load on a slow/failing HDD.
+SCAN_DELAY_SECONDS = 0.0
+
 # AI parameters
 TEMPERATURE = 0.1
 MAX_TOKENS = 4000
@@ -3233,6 +3237,7 @@ def scan_riddims(root: Path):
         seen.add(norm)
 
         yield folder, nearest_year(folder)
+        time.sleep(SCAN_DELAY_SECONDS)
 
 
 # ============================================================
@@ -3275,7 +3280,6 @@ def main():
 
     memory = Memory(STATE_DB)
 
-    # Initialize folder tracking records before building target_folders
     if target_riddim is not None:
         year = None
         if target_riddim.parent.name.isdigit() and len(target_riddim.parent.name) == 4:
@@ -3283,9 +3287,11 @@ def main():
         memory.upsert_folder_status(target_riddim, target_riddim.name, year)
         target_folders = [(target_riddim, year)]
     else:
-        target_folders = list(scan_riddims(ROOT_FOLDER))
-        for folder, y in target_folders:
+        target_folders = []
+        scan_iter = scan_riddims(ROOT_FOLDER)
+        for folder, y in scan_iter:
             memory.upsert_folder_status(folder, folder.name, y)
+            target_folders.append((folder, y))
 
     if target_riddim is not None:
         target_name = target_riddim.name
