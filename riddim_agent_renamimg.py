@@ -15,6 +15,7 @@ import yaml
 
 import requests
 from mutagen import File as MutagenFile
+from tqdm import tqdm
 
 
 # ============================================================
@@ -3289,9 +3290,16 @@ def main():
     else:
         target_folders = []
         scan_iter = scan_riddims(ROOT_FOLDER)
-        for folder, y in scan_iter:
-            memory.upsert_folder_status(folder, folder.name, y)
-            target_folders.append((folder, y))
+        with tqdm(
+            scan_iter,
+            desc="Scanning riddims",
+            unit="folder",
+            leave=True,
+        ) as pbar:
+            for folder, y in pbar:
+                pbar.set_postfix_str(folder.name)
+                memory.upsert_folder_status(folder, folder.name, y)
+                target_folders.append((folder, y))
 
     if target_riddim is not None:
         target_name = target_riddim.name
