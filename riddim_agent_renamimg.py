@@ -3223,16 +3223,16 @@ def scan_riddims(root: Path, memory: Memory | None = None):
                 return parent.name
         return None
 
-    # Resume: skip folders already scanned (from previous interrupted run)
-    scanned_paths = set()
+    # Resume: skip folders already completed (from previous interrupted run)
+    completed_paths = set()
     if memory is not None:
         try:
             rows = memory.conn.execute(
-                "SELECT folder_path FROM folder_status"
+                "SELECT folder_path FROM folder_status WHERE status = 'completed'"
             ).fetchall()
-            scanned_paths = {row[0] for row in rows}
+            completed_paths = {row[0] for row in rows}
         except Exception:
-            scanned_paths = set()
+            completed_paths = set()
 
     seen = set()
 
@@ -3240,8 +3240,8 @@ def scan_riddims(root: Path, memory: Memory | None = None):
         if not folder.is_dir():
             continue
 
-        # Resume: skip folders already recorded in folder_status
-        if str(folder.resolve()) in scanned_paths:
+        # Resume: skip folders already completed
+        if str(folder.resolve()) in completed_paths:
             continue
 
         if not folder_has_audio(folder):
