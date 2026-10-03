@@ -3602,6 +3602,7 @@ def main():
         if folder_status and folder_status.get("status") == "completed":
             log(f"Skipping already completed folder: {folder.name}")
             continue
+        memory.upsert_folder_status(folder, folder.name, y)
         pending_folders.append((folder, y))
 
     log(f"Resuming: {len(pending_folders)} folder(s) remaining to process.")
