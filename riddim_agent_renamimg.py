@@ -3196,7 +3196,7 @@ class RiddimAgent:
 # SCAN
 # ============================================================
 
-def scan_riddims(root: Path):
+def scan_riddims(root: Path, memory: Memory | None = None):
 
     audio_extensions = {
         ".mp3",
@@ -3223,10 +3223,25 @@ def scan_riddims(root: Path):
                 return parent.name
         return None
 
+    # Resume: skip folders already scanned (from previous interrupted run)
+    scanned_paths = set()
+    if memory is not None:
+        try:
+            rows = memory.conn.execute(
+                "SELECT folder_path FROM folder_status"
+            ).fetchall()
+            scanned_paths = {row[0] for row in rows}
+        except Exception:
+            scanned_paths = set()
+
     seen = set()
 
     for folder in sorted(root.rglob("*")):
         if not folder.is_dir():
+            continue
+
+        # Resume: skip folders already recorded in folder_status
+        if str(folder.resolve()) in scanned_paths:
             continue
 
         if not folder_has_audio(folder):
@@ -3289,7 +3304,7 @@ def main():
         target_folders = [(target_riddim, year)]
     else:
         target_folders = []
-        scan_iter = scan_riddims(ROOT_FOLDER)
+        scan_iter = scan_riddims(ROOT_FOLDER, memory=memory)
         with tqdm(
             scan_iter,
             desc="Scanning riddims",
@@ -3300,6 +3315,18 @@ def main():
                 pbar.set_postfix_str(folder.name)
                 memory.upsert_folder_status(folder, folder.name, y)
                 target_folders.append((folder, y))
+
+    # Filter out already-completed folders so the global progress bar
+    # reflects only the work remaining on this run.
+    pending_folders = []
+    for folder, y in target_folders:
+        folder_status = memory.get_folder_progress(folder.name)
+        if folder_status and folder_status.get("status") == "completed":
+            log(f"Skipping already completed folder: {folder.name}")
+            continue
+        pending_folders.append((folder, y))
+
+    log(f"Resuming: {len(pending_folders)} folder(s) remaining to process.")
 
     if target_riddim is not None:
         target_name = target_riddim.name
@@ -3348,12 +3375,21 @@ def main():
             memory
         )
 
-        for riddim_folder, year in target_folders:
-            # Skip entirely completed folders
-            folder_status = memory.get_folder_progress(riddim_folder.name)
-            if folder_status and folder_status.get("status") == "completed":
-                log(f"Skipping already completed folder: {riddim_folder.name}")
-                continue
+        # Global progress bar across all remaining folders.
+        with tqdm(
+            pending_folders,
+            desc="Processing riddims",
+            unit="folder",
+            leave=True,
+        ) as global_pbar:
+            for riddim_folder, year in global_pbar:
+                global_pbar.set_postfix_str(riddim_folder.name)
+                # Skip entirely completed folders (defensive check).
+                folder_status = memory.get_folder_progress(riddim_folder.name)
+                if folder_status and folder_status.get("status") == "completed":
+                    log(f"Skipping already completed folder: {riddim_folder.name}")
+                    global_pbar.update(1)
+                    continue
 
             log("")
             log("=" * 70)
