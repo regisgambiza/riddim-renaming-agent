@@ -1,11 +1,14 @@
+# Virtual environment
+.venv/
 venv/
-__pycache__/
-riddim_agent_memory.db
-*.txt
-*.pyc
-.env
-.idea/
-.vscode/
-*.egg-info/
-dist/
-build/
+env/
+
+# Logs
+logs/
+*.log
+
+# Database
+*.db
+
+# Error files
+*.err
