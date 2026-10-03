@@ -44,7 +44,7 @@ MAX_AGENT_STEPS = 40
 
 # Seconds to pause between scanned folders during initial scan.
 # Increase this to reduce I/O load on a slow/failing HDD.
-SCAN_DELAY_SECONDS = 1.0
+SCAN_DELAY_SECONDS = 0.0
 
 # AI parameters
 TEMPERATURE = 0.1
@@ -1431,6 +1431,48 @@ class ToolExecutor:
 
         return result
 
+    def verify_artist(self, artist_name: str, riddim_name: str) -> dict:
+        """
+        Mandatory artist verification.
+        1. Check local cache
+        2. If not cached or unverified → search Spotify+YouTube
+        3. Return {"name": verified_name, "verified": 1|2, "source": "cache"|"api"|"none"}
+        """
+        if not artist_name or not artist_name.strip():
+            return {"name": "", "verified": 0, "source": "none", "reason": "Empty artist name"}
+
+        # 1. Check cache
+        cached = self.memory.get_artist_cache(artist_name)
+        if cached and cached.get("verified") in (1, 2):
+            return {
+                "name": artist_name,
+                "verified": cached["verified"],
+                "source": cached.get("source", "cache"),
+                "spotify_id": cached.get("spotify_id"),
+                "youtube_channel_id": cached.get("youtube_channel_id"),
+            }
+
+        # 2. Search (both Spotify and YouTube via _search_artist_online)
+        result = self._search_artist_online({"artist_name": artist_name})
+        verified = result.get("verified", 0)
+
+        if verified in (1, 2):
+            return {
+                "name": result.get("artist_name", artist_name),
+                "verified": verified,
+                "source": result.get("source", "api"),
+                "spotify_id": result.get("spotify_id"),
+                "youtube_channel_id": result.get("youtube_channel_id"),
+            }
+
+        # 3. Still unverified after search
+        return {
+            "name": artist_name,
+            "verified": 0,
+            "source": "none",
+            "reason": "Artist not found on Spotify or YouTube",
+        }
+
 
 # ============================================================
 # LLAMA.CPP SERVER
@@ -1640,7 +1682,7 @@ class RiddimPlanner:
 
     def create_plan(self, folder, riddim, year, tracks):
         ai_log(
-            f"PLANNER: analyzing riddim one track at a time: {riddim}"
+            f"PLANNER: analyzing riddim batch: {riddim} ({len(tracks)} tracks)"
         )
 
         current_fp = collection_fingerprint(folder)
@@ -1669,7 +1711,7 @@ class RiddimPlanner:
             metadata = track.get("metadata") or {}
             compact_metadata = {}
 
-            for key in ("title", "artist", "album", "albumartist", "genre", "date", "tracknumber", "discnumber"):
+            for key in ("title", "artist", "album", "albumartist", "genre", "date", "tracknumber", "discnumber", "compilation"):
                 value = metadata.get(key)
                 if value not in (None, "", [], {}):
                     compact_metadata[key] = value
@@ -1680,158 +1722,166 @@ class RiddimPlanner:
                 "metadata": compact_metadata,
             })
 
+        # Build artist verification context: cache lookups for each track's artist
+        artist_context = []
+        for track in compact_tracks:
+            artist_name = track["metadata"].get("artist", "") or track["metadata"].get("title", "")
+            if artist_name:
+                cached = self.memory.get_artist_cache(artist_name) if self.memory else None
+                artist_context.append({
+                    "artist_name": artist_name,
+                    "verified": cached.get("verified", 0) if cached else 0,
+                    "source": cached.get("source", "none") if cached else "none",
+                    "spotify_id": cached.get("spotify_id") if cached else None,
+                    "youtube_channel_id": cached.get("youtube_channel_id") if cached else None,
+                })
+
         plan = {
             "riddim": riddim,
             "year": year,
             "summary": (
-                f"Analyzed {len(compact_tracks)} tracks individually "
-                f"to reduce local-model load."
+                f"Analyzed {len(compact_tracks)} tracks in batch "
+                f"with artist/title identification."
             ),
-            "strategy": "One-track-at-a-time planning with lightweight prompts.",
+            "strategy": "Batch planning with artist verification context.",
             "tracks": [],
             "batch_warnings": [],
         }
 
-        for idx, track in enumerate(compact_tracks, start=1):
-            ai_log(
-                f"PLANNER: analyzing track {idx}/{len(compact_tracks)}: "
-                f"{track['filename']}"
-            )
+        messages = [
+            {
+                "role": "system",
+                "content": """
+You are the batch planner for a Jellyfin music-cleanup agent.
+Your job is to analyze ALL tracks in a riddim folder and identify the real ARTIST and TITLE for each track.
 
-            messages = [
-                {
-                    "role": "system",
-                    "content": """
-You are the single-track planner for a Jellyfin music-cleanup agent.
-
-Analyze ONE track at a time. Keep the prompt tiny so the local model can respond reliably.
-
-The folders are already correctly named.
-DO NOT rename folders.
-
-ABSOLUTE FORMAT RULES:
-- Return exactly one JSON object and nothing else.
-- Do not wrap the JSON in markdown code fences.
-- Do not include explanations, commentary, or prose.
-- Do not include trailing commas or comments.
+You receive:
+- riddim folder name
+- year folder
+- list of tracks with: filename, embedded metadata, and cached artist verification status
 
 JELLYFIN FILENAME STANDARD (MUST follow exactly):
 - Format: Artist - Title.ext
 - Example: "Capleton - In Her Heart.mp3"
 - Any leading track number in the filename is WRONG and must be removed.
 - Examples of WRONG filenames: "01 - Capleton - In Her Heart.mp3", "01. Capleton - In Her Heart.mp3", "02 - 02 Assassin - Still Want More.mp3"
-- If the filename contains a leading track number or duplicated track number, action MUST be CLEAN.
 
-Schema:
+ARTIST/TITLE IDENTIFICATION RULES:
+- The filename may use patterns like "Artist - Title", "Artist @ Title", "Artist # Title", "NN - Artist - Title"
+- The metadata may have artist/title swapped with the riddim name (e.g., metadata artist="Riddim Name", title="Real Artist")
+- If metadata artist matches the riddim folder name, it is LIKELY SWAPPED — the real artist is in the title field
+- If filename pattern is "Riddim @ Artist", the riddim is the folder name, not the artist
+- Use sibling tracks for consistency: if multiple tracks show the same artist name, it is likely correct
+- Cached artist verification: if provided, it shows whether an artist name was verified via Spotify/YouTube
+  - verified: 0 = not verified, 1 = Spotify verified, 2 = Spotify+YouTube verified
+  - source: "cache" (from local DB), "api" (from live search), "none" (no verification attempted)
+
+SWAP DETECTION:
+- If you detect a swap, set "action": "SWAP_ARTIST_TITLE" and the agent will swap artist/title before writing metadata
+- After swap, re-evaluate whether the new artist is verified or needs review
+
+ACTIONS:
+- KEEP: track already matches Jellyfin standard (clean filename + correct metadata)
+- CLEAN: track needs renaming/metadata fix (provide correct artist/title)
+- SWAP_ARTIST_TITLE: artist and title are swapped; agent will swap and re-evaluate
+- NEEDS_REVIEW: insufficient evidence, unclear artist, or unverified artist
+
+SCHEMA (return EXACTLY this JSON array, no markdown, no prose):
 {
-    "action": "KEEP|CLEAN|RESEARCH|NEEDS_REVIEW",
-    "confidence": "HIGH|MEDIUM|LOW",
-    "reason": "..."
+  "tracks": [
+    {
+      "path": "...",
+      "action": "KEEP|CLEAN|SWAP_ARTIST_TITLE|NEEDS_REVIEW",
+      "artist": "Real Artist Name",
+      "title": "Real Song Title",
+      "track_number": 1,
+      "confidence": "HIGH|MEDIUM|LOW",
+      "reason": "Concise operational reason"
+    },
+    ...
+  ],
+  "batch_warnings": ["..."]
 }
 
-Rules:
-- Never invent artist or title information.
-- If evidence is insufficient, use NEEDS_REVIEW.
-- LOW confidence must not result in an automatic modification.
-- Keep the reason concise but operational.
-- Do NOT include "path" or "filename" in the response object. These fields are for input only. The agent already knows the file paths from its own filesystem scan.
-- Do NOT include "artist", "title", or "track_number" in the response object. These fields are derived from filename and metadata by the agent, not the LLM.
-- If the filename does NOT match "Artist - Title.ext", action MUST be CLEAN.
-- A CLEAN action means the track needs to be renamed to the clean artist-title format and its metadata track number preserved/updated.
+ABSOLUTE FORMAT RULES:
+- Return exactly one JSON object with a "tracks" array and optional "batch_warnings" array
+- Do not wrap in markdown code fences
+- Do not include explanations, commentary, or prose
+- Do not include trailing commas or comments
+- "path" MUST match the input track path exactly
+- "artist" and "title" MUST be filled with your identified real artist/title
+- "track_number" should be the track number (from filename or metadata)
 """
-                },
-                {
+            },
+            {
                     "role": "user",
                     "content": json.dumps({
                         "folder": str(folder),
                         "riddim": riddim,
                         "year": year,
-                        "track": track
+                        "tracks": compact_tracks,
+                        "artist_cache": artist_context
                     }, ensure_ascii=False, indent=2)
                 }
-            ]
+        ]
 
-            message = self.llm.chat(
-                messages,
-                tools=None,
-                response_format={
-                    "type": "json_object"
-                }
-            )
+        message = self.llm.chat(
+            messages,
+            tools=None,
+            response_format={
+                "type": "json_object"
+            }
+        )
 
-            content = message.get("content", "").strip()
-            ai_log(f"PLANNER: raw response (first 200 chars): {content[:200]}")
+        content = message.get("content", "").strip()
+        ai_log(f"PLANNER: raw response (first 500 chars): {content[:500]}")
 
-            if "```" in content:
-                start_idx = content.find("```")
-                after_first = content[start_idx + 3:]
-                end_idx = after_first.find("```")
-                if end_idx != -1:
-                    content = after_first[:end_idx].strip()
-                    if content.startswith("json"):
-                        content = content[4:].strip()
-                else:
-                    lines = content.split("\n")
-                    if lines:
-                        content = "\n".join(lines[1:]).strip()
+        if "```" in content:
+            start_idx = content.find("```")
+            after_first = content[start_idx + 3:]
+            end_idx = after_first.find("```")
+            if end_idx != -1:
+                content = after_first[:end_idx].strip()
+                if content.startswith("json"):
+                    content = content[4:].strip()
+            else:
+                lines = content.split("\n")
+                if lines:
+                    content = "\n".join(lines[1:]).strip()
 
-            try:
-                decision = json.loads(content)
-            except json.JSONDecodeError:
-                start = content.find('{')
-                end = content.rfind('}')
-                if start != -1 and end != -1 and end > start:
-                    json_str = content[start:end+1]
-                    try:
-                        decision = json.loads(json_str)
-                    except json.JSONDecodeError as exc:
-                        error_log(
-                            f"Planner returned invalid JSON for {track['filename']}: {exc}\n"
-                            f"Content (first 200 chars): {content[:200]}"
-                        )
-                        decision = {
-                            "path": track.get("path"),
-                            "filename": track.get("filename"),
-                            "action": "NEEDS_REVIEW",
-                            "artist": "",
-                            "title": "",
-                            "track_number": 0,
-                            "confidence": "LOW",
-                            "reason": "Planner returned invalid JSON; queued for review.",
-                        }
-                else:
-                    ai_log(f"PLANNER: No JSON object found for {track['filename']}")
+        try:
+            plan_data = json.loads(content)
+        except json.JSONDecodeError:
+            start = content.find('{')
+            end = content.rfind('}')
+            if start != -1 and end != -1 and end > start:
+                json_str = content[start:end+1]
+                try:
+                    plan_data = json.loads(json_str)
+                except json.JSONDecodeError as exc:
                     error_log(
-                        f"Planner returned invalid JSON for {track['filename']}: No JSON object found\n"
+                        f"Planner returned invalid JSON for riddim {riddim}: {exc}\n"
                         f"Content (first 500 chars): {content[:500]}"
                     )
-                    decision = {
-                        "path": track.get("path"),
-                        "filename": track.get("filename"),
-                        "action": "NEEDS_REVIEW",
-                        "artist": "",
-                        "title": "",
-                        "track_number": 0,
-                        "confidence": "LOW",
-                        "reason": "Planner returned invalid JSON; queued for review.",
-                    }
+                    plan_data = {"tracks": [], "batch_warnings": ["Planner returned invalid JSON"]}
 
-            if not isinstance(decision, dict):
-                decision = {
-                    "path": track.get("path"),
-                    "filename": track.get("filename"),
-                    "action": "NEEDS_REVIEW",
-                    "artist": "",
-                    "title": "",
-                    "track_number": 0,
-                    "confidence": "LOW",
-                    "reason": "Planner response was not a track decision.",
-                }
+        if not isinstance(plan_data, dict) or "tracks" not in plan_data:
+            error_log(f"Planner response was not a valid plan for {riddim}")
+            plan_data = {"tracks": [], "batch_warnings": ["Planner response was not a valid plan"]}
 
-            # Defense-in-depth: always use the actual filesystem path.
-            # The LLM must never provide file paths; they are owned by the agent.
-            decision["path"] = track.get("path")
-            decision["filename"] = track.get("filename")
+        decisions = plan_data.get("tracks", [])
+        batch_warnings = plan_data.get("batch_warnings", [])
+
+        # Defense-in-depth: always use the actual filesystem path.
+        # The LLM must never provide file paths; they are owned by the agent.
+        for idx, decision in enumerate(decisions):
+            if idx < len(compact_tracks):
+                decision["path"] = compact_tracks[idx].get("path")
+                decision["filename"] = compact_tracks[idx].get("filename")
+            else:
+                decision["path"] = decision.get("path", "")
+                decision["filename"] = Path(decision.get("path", "")).name
+
             decision.setdefault("action", "NEEDS_REVIEW")
             decision.setdefault("artist", "")
             decision.setdefault("title", "")
@@ -1844,7 +1894,7 @@ Rules:
             # Defense: if LLM says KEEP but filename doesn't match the
             # global Jellyfin standard (Artist - Title.ext), force CLEAN.
             if decision.get("action") == "KEEP":
-                fn = Path(track.get("filename", ""))
+                fn = Path(decision.get("filename", ""))
                 stem = fn.stem
                 if re.match(r'^\d{1,2}(\s*[-.]\s*|\s+)', stem) or not re.match(r'^.+\s*-\s*.+$', stem):
                     decision["action"] = "CLEAN"
@@ -1859,6 +1909,7 @@ Rules:
 
             plan["tracks"].append(decision)
 
+        plan["batch_warnings"] = batch_warnings
         plan["collection_fingerprint"] = current_fp
         plan["folder"] = str(folder)
         plan["key"] = key
@@ -1877,11 +1928,9 @@ Rules:
 # LLM CLIENT
 # ============================================================
 
-SYSTEM_PROMPT = """
-You are an autonomous music-library cleanup agent.
+SYSTEM_PROMPT = """You are an autonomous music-library cleanup agent.
 
-Your job is to clean TRACK FILENAMES and EMBEDDED METADATA
-for Jellyfin.
+Your job is to clean TRACK FILENAMES and EMBEDDED METADATA for Jellyfin.
 
 IMPORTANT:
 - NEVER rename folders.
@@ -1891,8 +1940,7 @@ IMPORTANT:
 - You have tools. Use them when useful.
 - Inspect sibling tracks when the current track is ambiguous.
 - Existing correct metadata should normally be preserved.
-- You are allowed to make decisions, but actual modifications
-  require human approval.
+- You are allowed to make decisions, but actual modifications require human approval.
 
 Jellyfin target:
 Title = Song Title
@@ -1904,15 +1952,41 @@ Track Number = NN (stored in MP3 metadata only)
 Genre = Dancehall
 
 Confidence policy:
+HIGH: Multiple pieces of evidence agree.
+MEDIUM: Strong local evidence but incomplete confirmation.
+LOW: Weak, conflicting, or speculative evidence.
 
-HIGH:
-    Multiple pieces of evidence agree.
+IMPORTANT: Artist/Title identification rules (use these FIRST before any other reasoning):
+- The real ARTIST is the person/group who performed the song (e.g. "Beenie Man", "Vybz Kartel").
+- The real TITLE is the song name (e.g. "Ramping Shop", "Summer Time").
+- The RIDDIM is the instrumental/beat name (e.g. "Joy Ride", "Bogle"). The riddim is NEVER the artist.
+- If a filename says "RiddimName @ Performer", the performer is the ARTIST and the riddim is the ALBUM, not the artist.
+- If metadata says artist="RiddimName" but the filename shows a real performer name, the metadata artist is likely the riddim — SWAP the values.
+- Use filename AND metadata together: if they conflict, the filename usually indicates the correct artist/title split.
+- If you cannot determine which is artist vs title from the evidence, use NEEDS_REVIEW.
 
-MEDIUM:
-    Strong local evidence but incomplete confirmation.
+ACTION SCHEMA:
+You must return exactly one action per track. The action field is mandatory.
 
-LOW:
-    Weak, conflicting, or speculative evidence.
+Valid actions:
+- KEEP: Track metadata is already correct; no changes needed.
+- CLEAN: Metadata needs fixing; set new artist/title/track metadata.
+- SWAP_ARTIST_TITLE: The metadata artist and title are swapped (common in riddim music where the riddim name is stored as artist). Swap them so artist=real performer, title=song name.
+- NEEDS_REVIEW: Insufficient evidence to decide; flag for manual review.
+
+For KEEP and CLEAN actions, you must also provide:
+- artist: the correct artist name (string, non-empty)
+- title: the correct song title (string, non-empty)
+- track_number: the correct track number (integer, or null if unknown)
+- reason: why you chose this action
+- confidence: HIGH / MEDIUM / LOW
+
+For SWAP_ARTIST_TITLE, you must also provide:
+- artist: the REAL artist name (after swap)
+- title: the REAL song title (after swap)
+- track_number: the correct track number (integer, or null if unknown)
+- reason: explain the swap (e.g. "Metadata artist looks like riddim name; filename shows real performer")
+- confidence: HIGH / MEDIUM / LOW
 
 Do not explain private chain-of-thought.
 Instead provide concise operational reasoning:
@@ -1923,9 +1997,9 @@ Instead provide concise operational reasoning:
 
 ### STRICT RULES SECTION
 
-Throughout this task, you will encounter filename patterns that have established conventions. **When a filename matches one of the following patterns, you MUST adhere to the specified rules. These rules are mandatory constraints, not suggestions.**
+Throughout this task, you will encounter filename patterns that have established conventions. When a filename matches one of the following patterns, you MUST adhere to the specified rules. These rules are mandatory constraints, not suggestions.
 
-Rules are loaded from `config/rules.yaml` at startup. Each rule has:
+Rules are loaded from config/rules.yaml at startup. Each rule has:
 - A regex pattern to match against the filename
 - Mandatory metadata values that must be set (these override default reasoning)
 - Forbidden metadata values that must NOT be set
@@ -1946,10 +2020,40 @@ CURRENT RULES:
 
 If you are uncertain whether a rule applies, err on the side of checking. When in doubt, match the pattern case-insensitively.
 
-YOU CAN NOT OVERRIDE MANDATORY FIELDS FROM A MATCHED RULE. Even if your evidence suggests different values, the rule's mandatory values take precedence. You may only add optional metadata not covered by the rule, or choose NEEDS_REVIEW if the rule truly doesn't fit the track.
+YOU CANNOT OVERRIDE MANDATORY FIELDS FROM A MATCHED RULE. Even if your evidence suggests different values, the rule's mandatory values take precedence. You may only add optional metadata not covered by the rule, or choose NEEDS_REVIEW if the rule truly doesn't apply or cannot be overridden.
 
-IMPORTANT: If a rule matches but you need to override a mandatory field, you MUST respond with NEEDS_REVIEW and explain why the rule doesn't apply or cannot be overridden.
-"""
+### ARTIST VERIFICATION CONTEXT
+
+You will receive a list of cached artist verification results as "artist_cache". Each entry contains:
+- artist_name: the name that was searched
+- verified: whether the name was verified as a real artist
+- source: "spotify", "youtube", "cache", or null
+- spotify_id: Spotify artist ID if found
+- youtube_channel_id: YouTube channel ID if found
+
+Use this context to:
+1. Confirm whether an artist name is a real performer or a riddim/instrumental name
+2. Detect when metadata artist looks like a riddim name (contains "Riddim", "Diwali", "Bogle", "Dash", etc.) but the filename shows a real performer
+3. Decide if a SWAP_ARTIST_TITLE is needed
+
+If the artist is NOT verified, the agent will run a mandatory verification search after your decision. You do not need to search yourself — just identify the correct artist/title and flag for verification.
+
+### INPUT FORMAT
+
+You will receive the following context for each track:
+- track_path: full file path
+- filename: just the filename
+- riddim: the riddim folder name
+- year: the year folder
+- metadata: embedded metadata (artist, title, album, etc.)
+- filename_artist: artist parsed from filename (may be wrong)
+- filename_title: title parsed from filename (may be wrong)
+- filename_track_number: track number parsed from filename
+- filename_source: which pattern matched the filename
+- artist_cache: list of cached verification results for related artist names
+- siblings: list of sibling tracks with their metadata (for context)
+
+Use ALL available evidence to determine the correct artist and title. Do not rely solely on regex-parsed values from the filename — use the raw filename and metadata together to identify the real performer and song name."""
 
 
 class RiddimAgent:
@@ -2227,6 +2331,41 @@ class RiddimAgent:
                     skip_llm = False
 
                 if not skip_llm:
+                    # Collect sibling tracks for context
+                    siblings = []
+                    try:
+                        for sibling in path.parent.iterdir():
+                            if sibling.is_file() and sibling != path:
+                                sm = read_metadata(sibling)
+                                if "error" not in sm:
+                                    siblings.append({
+                                        "filename": sibling.name,
+                                        "artist": sm.get("artist", ""),
+                                        "title": sm.get("title", ""),
+                                    })
+                    except Exception:
+                        pass
+
+                    # Build artist_cache from local DB
+                    artist_cache = []
+                    candidate_names = set()
+                    candidate_names.add(fn_data["artist"])
+                    candidate_names.add(metadata.get("artist", ""))
+                    candidate_names.add(riddim)
+                    for sib in siblings:
+                        candidate_names.add(sib.get("artist", ""))
+                        candidate_names.add(sib.get("title", ""))
+                    for name in candidate_names:
+                        if name and name.strip():
+                            cached = self.memory.get_artist_cache(name.strip())
+                            artist_cache.append({
+                                "artist_name": name.strip(),
+                                "verified": cached.get("verified", 0) if cached else 0,
+                                "source": cached.get("source", "none") if cached else "none",
+                                "spotify_id": cached.get("spotify_id") if cached else None,
+                                "youtube_channel_id": cached.get("youtube_channel_id") if cached else None,
+                            })
+
                     context = {
                         "track_path": str(path),
                         "filename": path.name,
@@ -2237,6 +2376,8 @@ class RiddimAgent:
                         "filename_title": fn_data["title"],
                         "filename_track_number": fn_data["track_number"],
                         "filename_source": fn_data["source"],
+                        "artist_cache": artist_cache,
+                        "siblings": siblings,
                     }
 
                     messages = [
@@ -2270,17 +2411,35 @@ class RiddimAgent:
 
                     action = decision.get("action", "NEEDS_REVIEW")
 
-            if action == "KEEP":
-                # Build complete Jellyfin metadata using filename ground truth
-                # with strict-rules fallback for required fields.
-                metadata_artist = fn_data["artist"] or metadata.get("artist") or ""
-                metadata_title = fn_data["title"] or metadata.get("title") or ""
+                    # Mandatory artist verification AFTER LLM decision
+                    # (as per user requirement: verification happens after LLM identifies)
+                    verified_artist = None
+                    if action in ("KEEP", "CLEAN", "SWAP_ARTIST_TITLE"):
+                        candidate_artist = decision.get("artist", "") or fn_data["artist"] or metadata.get("artist") or ""
+                        if candidate_artist:
+                            verified_artist = self.verify_artist(candidate_artist, riddim)
+                            if not verified_artist.get("verified"):
+                                ai_log(
+                                    f"Artist '{candidate_artist}' NOT verified for {path.name} "
+                                    f"(source: {verified_artist.get('source', 'none')}). Forcing NEEDS_REVIEW."
+                                )
+                                decision["needs_review"] = True
+                                decision["reason"] = (
+                                    f"Artist '{candidate_artist}' could not be verified via Spotify/YouTube. "
+                                    f"Manual review required."
+                                )
+                                action = "NEEDS_REVIEW"
 
-                # Ensure artist and title are not empty after stripping
+            if action == "KEEP":
+                # Use the LLM's identified artist/title as ground truth (verified by agent-side search)
+                metadata_artist = decision.get("artist", "")
+                metadata_title = decision.get("title", "")
+
+                # Fallback: if LLM didn't provide values, use embedded metadata first, then filename-derived values.
+                # Embedded metadata is the ground truth; filename values may have incorrect case.
                 if not metadata_artist or not metadata_title:
-                    # Try to salvage from existing metadata if filename parse was empty
-                    metadata_artist = metadata.get("artist") or ""
-                    metadata_title = metadata.get("title") or ""
+                    metadata_artist = metadata.get("artist") or fn_data["artist"] or ""
+                    metadata_title = metadata.get("title") or fn_data["title"] or ""
 
                 # Use the same logic as CLEAN path for track number
                 metadata_tracknumber = metadata.get("tracknumber")
@@ -2378,27 +2537,127 @@ class RiddimAgent:
                     )
                 return
 
-            if action == "CLEAN":
-                # Ground truth: prefer embedded metadata over filename-derived values,
-                # because many files in this collection have the correct metadata even
-                # when the filename is wrong.
-                #
-                # However, if a strict rule was applied, use its mandatory metadata
-                # (these are non-negotiable).
-                if decision.get("metadata"):
-                    metadata_artist = decision["metadata"].get("artist", "")
-                    metadata_title = decision["metadata"].get("title", "")
-                    metadata_tracknumber = decision["metadata"].get("track_number")
+            if action == "SWAP_ARTIST_TITLE":
+                # Swap artist and title as identified by LLM
+                swapped_artist = decision.get("title", "")
+                swapped_title = decision.get("artist", "")
+
+                ai_log(
+                    f"SWAP ARTIST/TITLE: '{decision.get('artist', '')}' -> artist, "
+                    f"'{decision.get('title', '')}' -> title for {path.name}"
+                )
+
+                # Use swapped values
+                metadata_artist = swapped_artist
+                metadata_title = swapped_title
+
+                # Fall back to metadata if LLM didn't provide both
+                if not metadata_artist or not metadata_title:
+                    # Use embedded metadata first (ground truth), then filename-derived values.
+                    # Rule-decision metadata is NOT used because it's derived from the filename
+                    # (which may have incorrect case), whereas embedded metadata is the ground truth.
+                    metadata_artist = metadata_artist or metadata.get("artist") or fn_data["artist"] or ""
+                    metadata_title = metadata_title or metadata.get("title") or fn_data["title"] or ""
+
+                artist = metadata_artist.strip()
+                title = metadata_title.strip()
+
+                # Track number: same logic as CLEAN
+                if decision.get("track_number") is not None:
+                    track_number = decision.get("track_number")
                 else:
-                    metadata_artist = strip_leading_track_number(metadata.get("artist"))
-                    metadata_title = (metadata.get("title") or "").strip()
+                    metadata_tracknumber = metadata.get("tracknumber")
+                    try:
+                        if isinstance(metadata_tracknumber, list):
+                            metadata_tracknumber = metadata_tracknumber[0] if metadata_tracknumber else None
+                        if metadata_tracknumber is not None:
+                            metadata_tracknumber = int(str(metadata_tracknumber).split("/")[0].strip())
+                    except Exception:
+                        metadata_tracknumber = None
 
-                artist = metadata_artist or (fn_data["artist"] or "").strip()
-                title = metadata_title or (fn_data["title"] or "").strip()
+                    if fn_data["track_number"] is not None:
+                        track_number = fn_data["track_number"]
+                    elif metadata_tracknumber is not None:
+                        track_number = metadata_tracknumber
+                    else:
+                        track_number = self._next_track_number(riddim)
 
-                # Use rule track number if present, otherwise existing logic
-                if decision.get("metadata") and "track_number" in decision["metadata"]:
-                    track_number = int(decision["metadata"]["track_number"])
+                if riddim not in self._used_track_nums:
+                    self._used_track_nums[riddim] = set()
+                    self._track_num_counter[riddim] = 1
+
+                if track_number:
+                    if track_number in self._used_track_nums[riddim]:
+                        track_number = self._next_track_number(riddim)
+                    else:
+                        self._used_track_nums[riddim].add(track_number)
+                        if track_number >= self._track_num_counter[riddim]:
+                            self._track_num_counter[riddim] = track_number + 1
+                else:
+                    track_number = self._next_track_number(riddim)
+
+                # Verify we have required data before proceeding
+                if not artist or not title:
+                    self.memory.upsert_track({
+                        "fingerprint": fp,
+                        "path": str(path),
+                        "riddim": riddim,
+                        "year": year,
+                        "status": "needs_review",
+                        "last_decision": "NEEDS_REVIEW",
+                        "confidence": "LOW",
+                        "reason": "Cannot determine artist/title after swap",
+                    })
+                    return
+
+                self.tools.pending_proposals.append({
+                    "path": str(path),
+                    "artist": artist,
+                    "title": title,
+                    "track_number": int(track_number),
+                    "confidence": decision.get("confidence", "HIGH"),
+                    "reason": f"Swapped artist/title. Original reason: {decision.get('reason', 'Swap detected by LLM')}",
+                    "rule_applied": decision.get("rule_applied"),
+                    "rule_metadata": decision.get("metadata"),
+                })
+                self.memory.upsert_track({
+                    "fingerprint": fp,
+                    "path": str(path),
+                    "riddim": riddim,
+                    "year": year,
+                    "status": "pending_review",
+                    "last_decision": "CLEAN",
+                    "confidence": decision.get("confidence", "HIGH"),
+                    "reason": f"Swapped artist/title: {decision.get('reason', 'Swap detected')}",
+                    "artist": artist,
+                    "title": title,
+                    "album": riddim,
+                    "rule_applied": decision.get("rule_applied"),
+                })
+                log(f"Swapped artist/title for: {path.name}")
+                log(f"  Old: artist='{metadata.get('artist')}', title='{metadata.get('title')}'")
+                log(f"  New: artist='{artist}', title='{title}'")
+
+            if action == "CLEAN":
+                # Use the LLM's identified artist/title as ground truth (verified by agent-side search)
+                metadata_artist = decision.get("artist", "")
+                metadata_title = decision.get("title", "")
+
+                # Fallback: if LLM didn't provide values, use current file metadata, then filename-derived values.
+                # Rule-decision metadata is NOT used for artist/title because it's derived from the filename
+                # (which may have incorrect case), whereas embedded metadata is the ground truth.
+                if not metadata_artist or not metadata_title:
+                    metadata_artist = metadata_artist or metadata.get("artist") or fn_data["artist"] or ""
+                    metadata_title = metadata_title or metadata.get("title") or fn_data["title"] or ""
+                    artist = metadata_artist or (fn_data["artist"] or "").strip()
+                    title = metadata_title or (fn_data["title"] or "").strip()
+                else:
+                    artist = metadata_artist.strip()
+                    title = metadata_title.strip()
+
+                # Use the LLM's track number if provided, otherwise existing logic
+                if decision.get("track_number") is not None:
+                    track_number = decision.get("track_number")
                 else:
                     metadata_tracknumber = metadata.get("tracknumber")
                     if isinstance(metadata_tracknumber, list):
@@ -2529,7 +2788,7 @@ class RiddimAgent:
             m = re.search(pattern, content, re.IGNORECASE)
             if m:
                 action = m.group(1).upper()
-                if action in ("KEEP", "CLEAN", "NEEDS_REVIEW"):
+                if action in ("KEEP", "CLEAN", "NEEDS_REVIEW", "SWAP_ARTIST_TITLE"):
                     break
         else:
             # No structured action found - analyze prose for compliance indicators
@@ -2552,7 +2811,7 @@ class RiddimAgent:
                 "no.*issue",
                 "in good order"
             ]
-            
+
             non_compliance_indicators = [
                 "needs.*rename",
                 "must be renamed",
@@ -2569,13 +2828,29 @@ class RiddimAgent:
                 "wrong.*format",
                 "rename.*to",
                 "change.*to",
-                "update.*to"
+                "update.*to",
+                "swap.*artist.*title",
+                "artist.*title.*swap",
+                "artist and title are swap",
             ]
             
             compliance_score = sum(1 for indicator in compliance_indicators if re.search(indicator, content_lower))
             non_compliance_score = sum(1 for indicator in non_compliance_indicators if re.search(indicator, content_lower))
             
-            if compliance_score > non_compliance_score and compliance_score > 0:
+            # Check for explicit swap intent in prose
+            swap_indicators = [
+                "swap",
+                "swapped",
+                "swap.*artist.*title",
+                "artist.*is.*actually.*title",
+                "title.*is.*actually.*artist",
+                "metadata.*artist.*looks.*like.*riddim",
+            ]
+            swap_score = sum(1 for indicator in swap_indicators if re.search(indicator, content_lower))
+            
+            if swap_score > 0 and non_compliance_score > 0:
+                action = "SWAP_ARTIST_TITLE"
+            elif compliance_score > non_compliance_score and compliance_score > 0:
                 action = "KEEP"
             elif non_compliance_score > 0:
                 action = "CLEAN"
@@ -2759,7 +3034,10 @@ class RiddimAgent:
             )
             new_path = path.parent / new_name
 
-            if new_path == path:
+            # DEBUG
+            print(f"DEBUG: path.name={path.name!r}, new_name={new_name!r}, equal={path.name == new_name}")
+
+            if path.name == new_name:
                 failures = self.verify_single_track(path)
                 if failures:
                     raise RuntimeError(
@@ -2792,7 +3070,7 @@ class RiddimAgent:
 
             write_metadata(path, new_metadata)
 
-            if new_path != path:
+            if path.name != new_name:
                 path.rename(new_path)
 
             rule_applied = proposal.get("rule_applied")
