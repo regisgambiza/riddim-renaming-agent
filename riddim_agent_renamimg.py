@@ -3391,256 +3391,256 @@ def main():
                     global_pbar.update(1)
                     continue
 
-            log("")
-            log("=" * 70)
-            log(
-                f"RIDDIM: {riddim_folder.name}"
-            )
-            log(
-                f"YEAR: {year}"
-            )
-            log("=" * 70)
+                log("")
+                log("=" * 70)
+                log(
+                    f"RIDDIM: {riddim_folder.name}"
+                )
+                log(
+                    f"YEAR: {year}"
+                )
+                log("=" * 70)
 
-            tracks = list_riddim_tracks(
-                riddim_folder
-            )
-
-            memory.update_folder_track_count(riddim_folder, len(tracks))
-
-            log(
-                f"{len(tracks)} tracks found."
-            )
-
-            # Seed track number counter from existing filenames
-            # to avoid collisions with already-processed files
-            for t in tracks:
-                m = re.match(r'^(\d+)\s*-\s', t["filename"])
-                if m:
-                    num = int(m.group(1))
-                    existing = agent._track_num_counter.get(
-                        riddim_folder.name, 1
-                    )
-                    if num >= existing:
-                        agent._track_num_counter[riddim_folder.name] = num + 1
-
-            # --------------------------------------------------------
-            # BATCH-LEVEL PLANNING
-            # --------------------------------------------------------
-
-            planner = RiddimPlanner(
-                llm,
-                memory
-            )
-
-            plan = planner.create_plan(
-                folder=riddim_folder,
-                riddim=riddim_folder.name,
-                year=year,
-                tracks=[
-                    {
-                        "path": str(
-                            riddim_folder / x["filename"]
-                        ),
-                        "filename": x["filename"],
-                        "metadata": x["metadata"]
-                    }
-                    for x in tracks
-                ]
-            )
-
-            # --------------------------------------------------------
-            # DISPLAY PLAN
-            # --------------------------------------------------------
-
-            print()
-            print("BATCH PLAN")
-            print("-" * 70)
-
-            for decision in plan["tracks"]:
-
-                print(
-                    f'{decision["action"]:15} '
-                    f'{decision.get("filename", decision["path"])}'
+                tracks = list_riddim_tracks(
+                    riddim_folder
                 )
 
-                if decision.get("artist"):
-                    print(
-                        f'    - {decision["artist"]} - '
-                        f'{decision["title"]}'
-                    )
+                memory.update_folder_track_count(riddim_folder, len(tracks))
 
-                print(
-                    f'    confidence: '
-                    f'{decision["confidence"]}'
+                log(
+                    f"{len(tracks)} tracks found."
                 )
 
-                print(
-                    f'    reason: '
-                    f'{decision["reason"]}'
+                # Seed track number counter from existing filenames
+                # to avoid collisions with already-processed files
+                for t in tracks:
+                    m = re.match(r'^(\d+)\s*-\s', t["filename"])
+                    if m:
+                        num = int(m.group(1))
+                        existing = agent._track_num_counter.get(
+                            riddim_folder.name, 1
+                        )
+                        if num >= existing:
+                            agent._track_num_counter[riddim_folder.name] = num + 1
+
+                # --------------------------------------------------------
+                # BATCH-LEVEL PLANNING
+                # --------------------------------------------------------
+
+                planner = RiddimPlanner(
+                    llm,
+                    memory
                 )
 
-            if plan.get("batch_warnings"):
+                plan = planner.create_plan(
+                    folder=riddim_folder,
+                    riddim=riddim_folder.name,
+                    year=year,
+                    tracks=[
+                        {
+                            "path": str(
+                                riddim_folder / x["filename"]
+                            ),
+                            "filename": x["filename"],
+                            "metadata": x["metadata"]
+                        }
+                        for x in tracks
+                    ]
+                )
+
+                # --------------------------------------------------------
+                # DISPLAY PLAN
+                # --------------------------------------------------------
 
                 print()
-                print("BATCH WARNINGS")
+                print("BATCH PLAN")
+                print("-" * 70)
 
-                for warning in plan["batch_warnings"]:
-                    print(f"    ! {warning}")
+                for decision in plan["tracks"]:
 
-            # --------------------------------------------------------
-            # TRACK AGENT - PROCESS EVERY TRACK
-            # --------------------------------------------------------
-
-            for decision in plan["tracks"]:
-
-                path = Path(decision["path"])
-                assert path.exists(), f"Path does not exist: {path}"
-
-                if decision["action"] == "NEEDS_REVIEW":
-
-                    ai_log(
-                        f"Skipping uncertain track: {path.name}"
+                    print(
+                        f'{decision["action"]:15} '
+                        f'{decision.get("filename", decision["path"])}'
                     )
-                    memory.update_folder_progress(riddim_folder, riddim_folder.name, needs_review=True)
-                    continue
 
-                if decision["action"] == "KEEP":
-
-                    log(
-                        f"Processing already-correct track: {path.name}"
-                    )
-                    agent.process_track(
-                        path=path,
-                        riddim=riddim_folder.name,
-                        year=year
-                    )
-                    memory.update_folder_progress(riddim_folder, riddim_folder.name, completed=True)
-                    continue
-
-                if decision["action"] == "NEEDS_REVIEW":
-                    log(
-                        f"Processing review-needed track: {path.name}"
-                    )
-                    agent.process_track(
-                        path=path,
-                        riddim=riddim_folder.name,
-                        year=year
-                    )
-                    memory.update_folder_progress(riddim_folder, riddim_folder.name, needs_review=True)
-                    continue
-
-                try:
-                    agent.fix_track_until_verified(
-                        path=path,
-                        riddim=riddim_folder.name,
-                        year=year
-                    )
-                    memory.update_folder_progress(riddim_folder, riddim_folder.name, completed=True)
-                except Exception as exc:
-                    error_log_detailed(
-                        f"Track failed to fix: {path} ({riddim_folder.name}): {exc}",
-                        exc_info=sys.exc_info()
-                    )
-                    if processing_log:
-                        processing_log.log_error(
-                            f"Track failed to fix: {path} ({riddim_folder.name}): {exc}",
-                            exc_info=sys.exc_info()
+                    if decision.get("artist"):
+                        print(
+                            f'    - {decision["artist"]} - '
+                            f'{decision["title"]}'
                         )
-                    memory.update_folder_progress(
-                        riddim_folder,
-                        riddim_folder.name,
-                        needs_review=True
+
+                    print(
+                        f'    confidence: '
+                        f'{decision["confidence"]}'
                     )
 
-            # --------------------------------------------------------
-            # FIX-VERIFY-FIX LOOP
-            # Apply, verify, reprocess failures, repeat until clean
-            # --------------------------------------------------------
-
-            if agent.tools.pending_proposals:
-                iteration = 0
-                while agent.tools.pending_proposals:
-                    iteration += 1
-                    log(
-                        f"Fix-verify iteration {iteration}..."
+                    print(
+                        f'    reason: '
+                        f'{decision["reason"]}'
                     )
+
+                if plan.get("batch_warnings"):
+
+                    print()
+                    print("BATCH WARNINGS")
+
+                    for warning in plan["batch_warnings"]:
+                        print(f"    ! {warning}")
+
+                # --------------------------------------------------------
+                # TRACK AGENT - PROCESS EVERY TRACK
+                # --------------------------------------------------------
+
+                for decision in plan["tracks"]:
+
+                    path = Path(decision["path"])
+                    assert path.exists(), f"Path does not exist: {path}"
+
+                    if decision["action"] == "NEEDS_REVIEW":
+
+                        ai_log(
+                            f"Skipping uncertain track: {path.name}"
+                        )
+                        memory.update_folder_progress(riddim_folder, riddim_folder.name, needs_review=True)
+                        continue
+
+                    if decision["action"] == "KEEP":
+
+                        log(
+                            f"Processing already-correct track: {path.name}"
+                        )
+                        agent.process_track(
+                            path=path,
+                            riddim=riddim_folder.name,
+                            year=year
+                        )
+                        memory.update_folder_progress(riddim_folder, riddim_folder.name, completed=True)
+                        continue
+
+                    if decision["action"] == "NEEDS_REVIEW":
+                        log(
+                            f"Processing review-needed track: {path.name}"
+                        )
+                        agent.process_track(
+                            path=path,
+                            riddim=riddim_folder.name,
+                            year=year
+                        )
+                        memory.update_folder_progress(riddim_folder, riddim_folder.name, needs_review=True)
+                        continue
 
                     try:
-                        result = agent.apply_proposals()
+                        agent.fix_track_until_verified(
+                            path=path,
+                            riddim=riddim_folder.name,
+                            year=year
+                        )
+                        memory.update_folder_progress(riddim_folder, riddim_folder.name, completed=True)
                     except Exception as exc:
                         error_log_detailed(
-                            f"apply_proposals failed for {riddim_folder.name}: {exc}",
+                            f"Track failed to fix: {path} ({riddim_folder.name}): {exc}",
                             exc_info=sys.exc_info()
                         )
                         if processing_log:
                             processing_log.log_error(
+                                f"Track failed to fix: {path} ({riddim_folder.name}): {exc}",
+                                exc_info=sys.exc_info()
+                            )
+                        memory.update_folder_progress(
+                            riddim_folder,
+                            riddim_folder.name,
+                            needs_review=True
+                        )
+
+                # --------------------------------------------------------
+                # FIX-VERIFY-FIX LOOP
+                # Apply, verify, reprocess failures, repeat until clean
+                # --------------------------------------------------------
+
+                if agent.tools.pending_proposals:
+                    iteration = 0
+                    while agent.tools.pending_proposals:
+                        iteration += 1
+                        log(
+                            f"Fix-verify iteration {iteration}..."
+                        )
+
+                        try:
+                            result = agent.apply_proposals()
+                        except Exception as exc:
+                            error_log_detailed(
                                 f"apply_proposals failed for {riddim_folder.name}: {exc}",
                                 exc_info=sys.exc_info()
                             )
-                        break
+                            if processing_log:
+                                processing_log.log_error(
+                                    f"apply_proposals failed for {riddim_folder.name}: {exc}",
+                                    exc_info=sys.exc_info()
+                                )
+                            break
 
-                    # Verify the riddim folder
-                    failures = agent.verify_riddim_folder(
-                        riddim_folder
-                    )
+                        # Verify the riddim folder
+                        failures = agent.verify_riddim_folder(
+                            riddim_folder
+                        )
 
-                    if not failures:
+                        if not failures:
+                            log(
+                                f"All tracks verified compliant "
+                                f"after {iteration} iteration(s)."
+                            )
+                            break
+
                         log(
-                            f"All tracks verified compliant "
-                            f"after {iteration} iteration(s)."
+                            f"Iteration {iteration}: "
+                            f"{len(failures)} track(s) need fixing."
                         )
-                        break
 
-                    log(
-                        f"Iteration {iteration}: "
-                        f"{len(failures)} track(s) need fixing."
-                    )
-
-                    agent.reprocess_failed_tracks(
-                        failures,
-                        riddim_folder.name,
-                        year
-                    )
-
-                    if iteration >= 100:
-                        error_log(
-                            f"Max iterations reached; "
-                            f"{len(failures)} track(s) still non-compliant."
+                        agent.reprocess_failed_tracks(
+                            failures,
+                            riddim_folder.name,
+                            year
                         )
-                        break
 
-            # --------------------------------------------------------
-            # FOLDER STATUS UPDATE
-            # --------------------------------------------------------
-            folder_status = memory.get_folder_progress(riddim_folder.name)
-            if folder_status and folder_status.get("status") != "completed":
-                unresolved = agent.memory.get_unresolved_tracks(riddim_folder.name)
-                if not unresolved:
-                    memory.mark_folder_complete(riddim_folder, riddim_folder.name)
-                    log(f"Folder marked complete: {riddim_folder.name}")
-                else:
-                    memory.update_folder_progress(riddim_folder, riddim_folder.name, needs_review=True)
-                    log(f"Folder remains in progress: {riddim_folder.name} ({len(unresolved)} unresolved)")
+                        if iteration >= 100:
+                            error_log(
+                                f"Max iterations reached; "
+                                f"{len(failures)} track(s) still non-compliant."
+                            )
+                            break
 
-            # --------------------------------------------------------
-            # UNRESOLVED TRACKS REPORT
-            # --------------------------------------------------------
+                # --------------------------------------------------------
+                # FOLDER STATUS UPDATE
+                # --------------------------------------------------------
+                folder_status = memory.get_folder_progress(riddim_folder.name)
+                if folder_status and folder_status.get("status") != "completed":
+                    unresolved = agent.memory.get_unresolved_tracks(riddim_folder.name)
+                    if not unresolved:
+                        memory.mark_folder_complete(riddim_folder, riddim_folder.name)
+                        log(f"Folder marked complete: {riddim_folder.name}")
+                    else:
+                        memory.update_folder_progress(riddim_folder, riddim_folder.name, needs_review=True)
+                        log(f"Folder remains in progress: {riddim_folder.name} ({len(unresolved)} unresolved)")
 
-            unresolved = [
-                t for t in agent.memory.get_unresolved_tracks(
-                    riddim_folder.name
-                )
-            ]
-            if unresolved:
-                log(
-                    f"{len(unresolved)} track(s) remain unresolved "
-                    f"in {riddim_folder.name}:"
-                )
-                for t in unresolved:
-                    log(
-                        f"  - {t.get('filename', t.get('path'))}: "
-                        f"{t.get('reason', 'no reason')}"
+                # --------------------------------------------------------
+                # UNRESOLVED TRACKS REPORT
+                # --------------------------------------------------------
+
+                unresolved = [
+                    t for t in agent.memory.get_unresolved_tracks(
+                        riddim_folder.name
                     )
+                ]
+                if unresolved:
+                    log(
+                        f"{len(unresolved)} track(s) remain unresolved "
+                        f"in {riddim_folder.name}:"
+                    )
+                    for t in unresolved:
+                        log(
+                            f"  - {t.get('filename', t.get('path'))}: "
+                            f"{t.get('reason', 'no reason')}"
+                        )
 
         log("")
         log("=" * 70)
