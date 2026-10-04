@@ -48,11 +48,15 @@ SCAN_DELAY_SECONDS = 0.0
 
 # AI parameters
 TEMPERATURE = 0.1
-MAX_TOKENS = 4000
+MAX_TOKENS = 1500
 
 # llama.cpp settings
 CONTEXT_SIZE = 32768
-N_GPU_LAYERS = "auto"
+N_GPU_LAYERS = 20
+CPU_THREADS = 12
+BATCH_SIZE = 4096
+UBATCH_SIZE = 1024
+FLASH_ATTENTION = 1
 
 
 def _load_rules():
@@ -398,7 +402,91 @@ class Memory:
             data.get("fields_skipped"),
             data.get("fields_skipped_reason"),
         ))
+        self._drop_stale_track_rows(data)
         self.conn.commit()
+
+    def _drop_stale_track_rows(self, data):
+        """Drop older rows for the same file once it is finished.
+
+        A metadata write changes size and mtime, so the old fingerprint
+        no longer matches the file. Those leftover rows made the next
+        launch treat a finished track as new.
+        """
+        if data.get("status") not in {"completed", "approved", "compliant"}:
+            return
+        paths = []
+        for key in ("path", "original_path", "new_path"):
+            value = data.get(key)
+            if value and value not in paths:
+                paths.append(value)
+        for stored_path in paths:
+            self.conn.execute(
+                """DELETE FROM tracks
+                WHERE fingerprint != ?
+                  AND (path = ? OR original_path = ? OR new_path = ?)""",
+                (data["fingerprint"], stored_path, stored_path, stored_path)
+            )
+
+    def track_status(self, path: Path) -> str | None:
+        """Best known status for this file, ignoring mtime.
+
+        Finished wins over an older pending row for the same path.
+        """
+        values = []
+        raw = str(path)
+        for candidate in (raw, os.path.normpath(raw)):
+            if candidate not in values:
+                values.append(candidate)
+        try:
+            resolved = str(path.resolve())
+        except OSError:
+            resolved = None
+        if resolved and resolved not in values:
+            values.append(resolved)
+
+        clauses = []
+        params = []
+        for value in values:
+            clauses.append("path = ? OR original_path = ? OR new_path = ?")
+            params.extend((value, value, value))
+
+        rows = self.conn.execute(
+            f"SELECT status FROM tracks WHERE {' OR '.join(clauses)}",
+            params,
+        ).fetchall()
+        if not rows:
+            return None
+
+        rank = {
+            "completed": 0,
+            "approved": 0,
+            "compliant": 0,
+            "needs_review": 1,
+            "error": 2,
+            "pending_review": 3,
+            "pending": 4,
+        }
+        return min((row["status"] for row in rows), key=lambda status: rank.get(status, 9))
+
+    def track_is_done(self, path: Path) -> bool:
+        return self.track_status(path) in {"completed", "approved", "compliant"}
+
+    def remember_completed_track(self, path: Path, riddim: str, year: str | None, reason: str):
+        if not path.exists():
+            return
+        resolved = str(path.resolve())
+        self.upsert_track({
+            "fingerprint": fingerprint(path),
+            "path": resolved,
+            "riddim": riddim,
+            "year": year,
+            "status": "completed",
+            "last_decision": "SKIP",
+            "confidence": "HIGH",
+            "reason": reason,
+            "original_path": resolved,
+            "new_path": resolved,
+        })
 
     def update_folder_track_count(self, folder_path: Path, total_tracks: int):
         self.conn.execute(
@@ -418,11 +506,21 @@ class Memory:
         return dict(row) if row else None
 
     def upsert_folder_status(self, folder_path: Path, riddim: str, year: str | None = None):
+        """Insert a folder row, or refresh its scan time.
+
+        An existing row keeps its status and counters. Replacing the row
+        here used to reset an interrupted folder back to pending.
+        """
         self.conn.execute(
-            """INSERT OR REPLACE INTO folder_status
+            """INSERT INTO folder_status
             (folder_path, riddim, year, total_tracks, completed_tracks, failed_tracks,
              needs_review_tracks, status, last_scan, last_processed, error_count)
-            VALUES (?, ?, ?, 0, 0, 0, 0, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 0)""",
+            VALUES (?, ?, ?, 0, 0, 0, 0, 'pending', CURRENT_TIMESTAMP, NULL, 0)
+            ON CONFLICT(folder_path) DO UPDATE SET
+                riddim=excluded.riddim,
+                year=COALESCE(excluded.year, folder_status.year),
+                last_scan=CURRENT_TIMESTAMP
+            """,
             (str(folder_path.resolve()), riddim, year)
         )
         self.conn.commit()
@@ -469,10 +567,10 @@ class Memory:
         )
         self.conn.commit()
 
-    def get_folder_progress(self, riddim: str) -> dict | None:
+    def get_folder_progress(self, folder_path: Path) -> dict | None:
         row = self.conn.execute(
-            "SELECT * FROM folder_status WHERE riddim=? ORDER BY last_scan DESC LIMIT 1",
-            (riddim,)
+            "SELECT * FROM folder_status WHERE folder_path=?",
+            (str(Path(folder_path).resolve()),)
         ).fetchone()
         return dict(row) if row else None
 
@@ -1506,14 +1604,20 @@ class LlamaServer:
         log("Starting llama.cpp server...")
 
         cmd = [
-            LLAMA_SERVER_EXE,
-            "-m", MODEL_PATH,
-            "--host", SERVER_HOST,
-            "--port", str(SERVER_PORT),
-            "-c", str(CONTEXT_SIZE),
-            "-ngl", str(N_GPU_LAYERS),
-            "--reasoning", "off",
-        ]
+                LLAMA_SERVER_EXE,
+                "-m", MODEL_PATH,
+                "--host", SERVER_HOST,
+                "--port", str(SERVER_PORT),
+                "-c", str(CONTEXT_SIZE),
+                "-ngl", str(N_GPU_LAYERS),
+                "-t", str(CPU_THREADS),
+                "-b", str(BATCH_SIZE),
+                "-ub", str(UBATCH_SIZE),
+                "-fa", str(FLASH_ATTENTION),
+                "--poll", "50",
+                "--mmap",
+                "--reasoning", "off",
+            ]
 
         log(" ".join(f'"{x}"' if " " in x else x for x in cmd))
 
@@ -1594,8 +1698,13 @@ class LLM:
 
     def __init__(self, server: LlamaServer):
         self.server = server
+        self._cache = {}
 
     def chat(self, messages, tools=None, response_format=None):
+
+        cache_key = json.dumps(messages, sort_keys=True, ensure_ascii=False)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
 
         payload = {
             "model": "local-model",
@@ -1604,9 +1713,6 @@ class LLM:
             "max_tokens": MAX_TOKENS,
         }
 
-        if response_format is not None:
-            payload["response_format"] = response_format
-
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
@@ -1614,9 +1720,15 @@ class LLM:
         response = requests.post(
             f"{self.server.base_url}/v1/chat/completions",
             json=payload,
-            timeout=600
+            timeout=1800
         )
-
+        
+        if not response.ok:
+            error_log(f"LLM API error: {response.status_code} {response.reason}")
+            error_log(f"Request URL: {self.server.base_url}/v1/chat/completions")
+            error_log(f"Request payload keys: {list(payload.keys())}")
+            error_log(f"Response text: {response.text[:1000]}")
+        
         response.raise_for_status()
 
         data = response.json()
@@ -1628,6 +1740,7 @@ class LLM:
             content = message["reasoning_content"]
             message["content"] = content
 
+        self._cache[cache_key] = message
         return message
 
 
@@ -1821,16 +1934,13 @@ ABSOLUTE FORMAT RULES:
                         "year": year,
                         "tracks": compact_tracks,
                         "artist_cache": artist_context
-                    }, ensure_ascii=False, indent=2)
+                    }, ensure_ascii=False, separators=(",", ":"))
                 }
         ]
 
         message = self.llm.chat(
             messages,
             tools=None,
-            response_format={
-                "type": "json_object"
-            }
         )
 
         content = message.get("content", "").strip()
@@ -3784,14 +3894,8 @@ def main():
                         continue
 
                     if decision["action"] == "KEEP":
-
                         log(
                             f"Processing already-correct track: {path.name}"
-                        )
-                        agent.process_track(
-                            path=path,
-                            riddim=riddim_folder.name,
-                            year=year
                         )
                         memory.update_folder_progress(riddim_folder, riddim_folder.name, completed=True)
                         continue
@@ -3800,36 +3904,33 @@ def main():
                         log(
                             f"Processing review-needed track: {path.name}"
                         )
-                        agent.process_track(
-                            path=path,
-                            riddim=riddim_folder.name,
-                            year=year
-                        )
                         memory.update_folder_progress(riddim_folder, riddim_folder.name, needs_review=True)
                         continue
 
-                    try:
+                    # Use planner's decision directly — skip redundant LLM call
+                    if decision.get("artist") and decision.get("title"):
+                        agent.tools.pending_proposals.append({
+                            "path": str(path),
+                            "artist": decision["artist"],
+                            "title": decision["title"],
+                            "track_number": decision.get("track_number") or 1,
+                            "confidence": decision.get("confidence", "HIGH"),
+                            "reason": decision.get("reason", ""),
+                            "planner_decision": decision,
+                        })
+                        log(
+                            f"Planner decision used for: {path.name} [{decision['action']}]"
+                        )
+                    else:
                         agent.fix_track_until_verified(
                             path=path,
                             riddim=riddim_folder.name,
                             year=year
                         )
-                        memory.update_folder_progress(riddim_folder, riddim_folder.name, completed=True)
-                    except Exception as exc:
-                        error_log_detailed(
-                            f"Track failed to fix: {path} ({riddim_folder.name}): {exc}",
-                            exc_info=sys.exc_info()
+                        log(
+                            f"Track processed via LLM: {path.name}"
                         )
-                        if processing_log:
-                            processing_log.log_error(
-                                f"Track failed to fix: {path} ({riddim_folder.name}): {exc}",
-                                exc_info=sys.exc_info()
-                            )
-                        memory.update_folder_progress(
-                            riddim_folder,
-                            riddim_folder.name,
-                            needs_review=True
-                        )
+                    memory.update_folder_progress(riddim_folder, riddim_folder.name, completed=True)
 
                 # --------------------------------------------------------
                 # FIX-VERIFY-FIX LOOP
@@ -3881,7 +3982,7 @@ def main():
                             year
                         )
 
-                        if iteration >= 100:
+                        if iteration >= 3:
                             error_log(
                                 f"Max iterations reached; "
                                 f"{len(failures)} track(s) still non-compliant."
